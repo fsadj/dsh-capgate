@@ -1,0 +1,4 @@
+node_modules/
+rules_doc.json
+results/
+*.log

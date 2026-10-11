@@ -1,0 +1,10 @@
+{
+  "name": "dsh-capgate",
+  "version": "0.1.0",
+  "description": "Capability-based auto-approval enhancement for DeepSeek Harness",
+  "type": "module",
+  "main": "index.ts",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": ">=0.2.1"
+  }
+}
