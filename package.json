@@ -1,0 +1,63 @@
+{
+  "name": "dsh-capgate",
+  "version": "0.2.0",
+  "description": "Effect-class amortized authorization for DeepSeek Harness: ask once per effect class, cite the user's words, then run deterministically at microsecond cost.",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "client.js",
+    "scripts",
+    "test",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "setup": "node scripts/setup.mjs",
+    "test": "node --test test/classify.test.mjs test/citations.test.mjs test/flow.test.mjs test/rules.test.mjs test/parity.test.mjs test/escalation.test.mjs test/learn.test.mjs",
+    "demo": "node scripts/demo.mjs",
+    "e2e": "node scripts/e2e.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/USER/dsh-capgate"
+  },
+  "homepage": "https://github.com/USER/dsh-capgate#readme",
+  "bugs": {
+    "url": "https://github.com/USER/dsh-capgate/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings-plugins"
+      ]
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "approval",
+    "capability",
+    "least-privilege"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "^3.18.0"
+  }
+}

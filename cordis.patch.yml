@@ -1,0 +1,50 @@
+# dsh-capgate bundle layer。
+#
+# 它做两件事：
+#   1) 把 capgate 作为**独立权限档位**加进 picker（覆盖 permission 行的预设表）
+#   2) 挂载插件本体，并把它绑定到这一档（requiredPreset）
+#
+# 为什么是"覆盖配置"而不是调 API：`dsh-permission-presets` 故意没有
+# "注册一个新预设"的接口（保留名只有 custom 与 auto，auto 由上游集成专用）。
+# 但预设表本身是 config，插件层可以用 patch 把自己的档位和三档内置档并列。
+#
+# 注意：presets 是整表替换，必须把内置三档原样抄一遍；dsh 升级后若内置表变了要同步。
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    defaultPreset: capgate
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      capgate:
+        sandbox: workspace-write
+        approval: ask
+        name: Capgate 自动判定
+        description: 效果类摊销授权：首次问一次，同类确定性放行；敏感路径、出网、批量仍拦。
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+
+- insert:
+    - id: capgate
+      name: 'dsh-capgate'
+      config:
+        mode: capgate
+        # 只有选中「Capgate 自动判定」档位时才生效；切到别的档 = 回到原生行为
+        requiredPreset: capgate
+        autoAllowReads: true
+        autoAllowOutsideReads: true
+        minimize: true
+        maxConsecutiveDenials: 3
+        grantTtlHours: 8
+        judgeMode: off
+        judgeAutoAllow: false
+        humanOnlyTools:
+          - send_money
+          - rotate_key
+          - drop_database
+        auditPath: ''
