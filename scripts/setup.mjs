@@ -15,11 +15,15 @@ const here = dirname(fileURLToPath(import.meta.url));
 const pkgRoot = resolve(here, '..');
 
 function globalRoot() {
+  // Windows 上 npm 是 .cmd，不能直接 execFile，必须经 cmd /c
   try {
-    const cmd = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-    return execFileSync(cmd, ['root', '-g'], { encoding: 'utf8' }).trim();
+    const out = process.platform === 'win32'
+      ? execFileSync('cmd', ['/c', 'npm', 'root', '-g'], { encoding: 'utf8' })
+      : execFileSync('npm', ['root', '-g'], { encoding: 'utf8' });
+    return out.trim();
   } catch {
-    return '';
+    const fallback = process.env.APPDATA ? join(process.env.APPDATA, 'npm', 'node_modules') : '';
+    return fallback && existsSync(fallback) ? fallback : '';
   }
 }
 
