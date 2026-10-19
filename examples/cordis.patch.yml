@@ -1,0 +1,38 @@
+# 粘到 ~/.dsh/profiles/web/cordis.patch.yml 末尾（Windows: %USERPROFILE%\.dsh\profiles\web\cordis.patch.yml）
+#
+# 两件事：
+#   1) 把「Capgate 自动判定」作为第 4 个权限档位加进选择器
+#   2) 挂载插件，并把它绑定到这一档（requiredPreset）
+#
+# 注意：
+#   - presets 是整表替换，三档内置档必须原样抄一遍；dsh 升级后若内置表变了要同步
+#   - 下面两处 <ABS_PATH> 改成 dsh-capgate 解压后的绝对路径（用正斜杠）
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    defaultPreset: capgate
+    presets:
+      read-only: { sandbox: read-only, approval: ask }
+      workspace-write: { sandbox: workspace-write, approval: ask }
+      capgate:
+        sandbox: workspace-write
+        approval: ask
+        name: Capgate 自动判定
+        description: 效果类摊销授权：首次问一次，同类确定性放行；敏感/出网/批量仍拦。
+      danger-full-access: { sandbox: danger-full-access, approval: never }
+
+- insert:
+    - id: capgate
+      name: '<ABS_PATH>/src/index.mjs'
+      config:
+        mode: capgate
+        requiredPreset: capgate
+        autoAllowReads: true
+        autoAllowOutsideReads: true
+        minimize: true
+        maxConsecutiveDenials: 3
+        grantTtlHours: 8
+        judgeMode: off
+        judgeAutoAllow: false
+        auditPath: ''
+        learnPath: ''

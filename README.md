@@ -52,12 +52,15 @@ node scripts/setup.mjs                 # 找不到 dsh 时：node scripts/setup.
 npm test        # 57 条单测
 npm run demo    # 131 次调用的摊销演示：6 次打扰，最后 60 次 0 新增
 
-# 3) 装进一个 web profile
-dsh plugin --profile web add ./       # 或者 pnpm dsh plugin --profile web add ./dsh-capgate
+# 3) 装进 web profile：把 examples/cordis.patch.yml 的内容贴到
+#    %USERPROFILE%\.dsh\profiles\web\cordis.patch.yml 末尾，并把 <ABS_PATH> 换成解压目录的绝对路径
+#    （首次没有这个文件：直接新建，内容就是那份示例）
 
 # 4) 启动
-dsh web --profile web
+dsh web
 ```
+
+> `dsh plugin add` 这条路需要本机有 `pnpm`；没有 pnpm 就用上面的 patch 方式，效果一样。
 
 打开页面后：右上角权限选择器 → 选 **「Capgate 自动判定」**（第 4 档，插件带的）。
 
@@ -77,12 +80,9 @@ dsh web --profile web
 
 ## 安装（手工/调试用）
 
-```bash
-# 1) 链接 dsh 的 schemastery（插件运行期需要）
-node scripts/setup.mjs
+最省事的方式就是 `examples/cordis.patch.yml`：整份贴进 profile 的 `cordis.patch.yml`，把 `<ABS_PATH>` 换成解压目录。
 
-# 2) 在 profile 的 cordis.patch.yml 里挂载（本地路径写法）
-```
+只挂插件、不要第 4 档的话，最小配置是：
 
 ```yaml
 - insert:
@@ -92,10 +92,10 @@ node scripts/setup.mjs
         mode: capgate
 ```
 
-或作为 bundle 安装（`cordis.patch.yml` 已按包名写好）：
+或作为 bundle 安装（`cordis.patch.yml` 已按包名写好；**需要本机有 pnpm**）：
 
 ```bash
-pnpm dsh plugin --profile <name> add ./capgate-dsh
+pnpm dsh plugin --profile web add ./capgate-dsh
 ```
 
 ### 作为独立权限档位（推荐）
