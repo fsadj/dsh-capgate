@@ -15,7 +15,7 @@
     "client.js",
     "scripts",
     "test",
-    "examples",
+    "examples",`n    "docs",
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",

@@ -118,3 +118,17 @@ test('完全不认识的命令不许当读（fail-closed）', () => {
   const e = parseShell('Some-Vendor-Tool --quiet --yes', ROOT);
   assert.equal(e.op, 'other', '未知命令要落到 other（会问人），不能退化成读');
 });
+
+test('会"变成另一条命令"的构造失去只读资格', () => {
+  const cases = [
+    'Get-Content a.txt | Invoke-Expression',
+    'iex (Get-Content payload.txt)',
+    'Get-Content a.txt | ForEach-Object { $_ | iex }',
+    'powershell -EncodedCommand ZQBjAGgAbwA=',
+    'echo $(Remove-Item C:/repo/a.txt)',
+  ];
+  for (const cmd of cases) {
+    const e = parseShell(cmd, ROOT);
+    assert.notEqual(e.op, 'read', `${cmd} 不能被证明为只读`);
+  }
+});

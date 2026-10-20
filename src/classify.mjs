@@ -137,6 +137,11 @@ export function parseShell(command, cwd, depth = 0) {
   // 这是三次真实漏放的共同根因：`.NET API`、`robocopy /MOV`、`cmd /c del` 都因为
   // "没匹配到动词"退化成 read，然后被"项目外普通读"快路静默放行。
   // 未知命令一律降到 'other'，交给"问人"而不是"放行"。
+  // "证明是无害的"并不等于"看起来像读"。这些构造能把一段文字变成另一段命令，
+  // 一旦出现，就不能再声称这条命令只是读——必须降级为未知、交给人。
+  const SUBSTITUTION = /\$\(|`[^`]*`|\biex\b|Invoke-Expression|EncodedCommand|base64\s+-d|\beval\b/i.test(text);
+  const BARE_STRING = /^\s*["'][^"']*["']\s*;?\s*$/;
+
   const anyKnownVerb = hasVerb(CMD_SETS.send) || hasVerb(CMD_SETS.delete)
     || hasVerb(CMD_SETS.write) || hasVerb(CMD_SETS.execute) || hasVerb(CMD_SETS.read);
   const unknown = !plainQuery && !API_DELETE && !ROBO_MOVE && !anyKnownVerb;
@@ -147,7 +152,15 @@ export function parseShell(command, cwd, depth = 0) {
     : hasVerb(CMD_SETS.execute) ? 'execute'
     : unknown ? 'other'
     : 'read';
-  const op = plainQuery ? 'read' : rawOp;
+  // 只有"能被证明只是读"的命令才算读：
+  //   - 每个分段的首词都在读动词表里（或整条只是一个字符串字面量）
+  //   - 没有重定向、没有命令替换/反引号/iex/base64 解码
+  // 任何一条不满足 → 降级为 other（问人），而不是猜成读。
+  const provenRead = !plainQuery && !SUBSTITUTION && !redirects && !API_DELETE && !ROBO_MOVE
+    && (BARE_STRING.test(text) || (hasVerb(CMD_SETS.read) && !hasVerb(CMD_SETS.send)
+      && !hasVerb(CMD_SETS.delete) && !hasVerb(CMD_SETS.write) && !hasVerb(CMD_SETS.execute)));
+
+  const op = plainQuery || provenRead ? 'read' : (rawOp === 'read' ? 'other' : rawOp);
 
   // 不透明执行：跑解释器/脚本时，真实效果（可能联网、写盘、删东西）藏在脚本里，
   // 命令文本看不出来。这类一律当作"未知效果"，不允许模型复核直接放行。
