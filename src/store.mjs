@@ -33,6 +33,7 @@ export class CapgateStore {
       s = {
         grants: new Map(), denials: new Map(), pending: new Map(), entities: [],
         repeats: new Map(), counters: { allow: 0, ask: 0, deny: 0, grant: 0, judge: 0 },
+        approvals: new Map(),
         createdAt: now(),
       };
       this.sessions.set(id, s);
@@ -79,6 +80,29 @@ export class CapgateStore {
     const n = (s.denials.get(key) ?? 0) + 1;
     s.denials.set(key, n);
     return n;
+  }
+
+  /**
+   * 一条具体的命令被人工批准过 → 记下来，同样的命令再来就不再打扰。
+   * 只按「完全相同的 tool+args」复用，不做模式推广：
+   * 批了 `rm Downloads/*.zip` 不代表同意 `rm Downloads/*.db`。
+   */
+  approveSignature(sessionId, signature) {
+    this.session(sessionId).approvals.set(signature, { at: now() });
+  }
+
+  hasSignature(sessionId, signature) {
+    const a = this.session(sessionId).approvals.get(signature);
+    if (!a) return false;
+    if (now() - a.at > this.grantTtlMs) {
+      this.session(sessionId).approvals.delete(signature);
+      return false;
+    }
+    return true;
+  }
+
+  dropSignature(sessionId, signature) {
+    this.session(sessionId).approvals.delete(signature);
   }
 
   setEntities(sessionId, entities) {

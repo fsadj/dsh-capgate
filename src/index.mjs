@@ -78,6 +78,21 @@ function readMode(value) {
   return value;
 }
 
+/** 把 arguments 变成稳定字符串：同样一条命令每次得到同样的签名。 */
+function stableKey(value) {
+  const seen = new WeakSet();
+  const walk = (v) => {
+    if (v === null || typeof v !== 'object') return v;
+    if (seen.has(v)) return '[circular]';
+    seen.add(v);
+    if (Array.isArray(v)) return v.map(walk);
+    const out = {};
+    for (const k of Object.keys(v).sort()) out[k] = walk(v[k]);
+    return out;
+  };
+  return JSON.stringify(walk(value ?? {}));
+}
+
 export function apply(ctx, config = {}) {
   const cfg = { ...DEFAULTS, ...config };
   const rules = compileRules({
@@ -113,6 +128,9 @@ export function apply(ctx, config = {}) {
 
   /** 已放行、等待工具发起"放宽沙箱"审批的调用：callId → 类别信息。 */
   const deferred = new Map();
+
+  /** callId → 调用签名（用于"完全相同的命令不重复问"） */
+  const signatures = new Map();
 
   /** 本会话审批策略：never（完全权限档）时无法询问 */
   function approvalPolicy(agent) {
@@ -218,6 +236,10 @@ export function apply(ctx, config = {}) {
     const { effect, klass } = classified;
     const label = describeClass(klass);
 
+    // 完全相同的调用只问一次：签名 = tool + 稳定序列化的参数
+    const signature = `${exec.name}|${stableKey(exec.arguments)}`;
+    if (exec.callId) signatures.set(String(exec.callId), signature);
+
     /** 这次调用是否在请求放宽沙箱（工具随后一定会自己发起原生审批）。 */
     const escalationMode = typeof exec.arguments?.sandbox_permissions === 'string'
       ? exec.arguments.sandbox_permissions
@@ -293,6 +315,13 @@ export function apply(ctx, config = {}) {
       );
     }
 
+    // 1.2b 完全相同的命令已被人工批准过 → 直接放行（不推广到"同类"，只认同一条）
+    if (store.hasSignature(sid, signature)) {
+      store.bump(sid, 'allow');
+      audit({ event: 'allow', by: 'identical', sid, tool: exec.name, class: klass.key });
+      return next();
+    }
+
     // 1.2b 已硬化的放行规则（必须经人显式确认；敏感路径已在上面被拦下）
     if (hasRule(learned, klass.key, 'allow')) {
       store.bump(sid, 'allow');
@@ -323,7 +352,7 @@ export function apply(ctx, config = {}) {
 
     // 1.5 批量/通配：必问
     if (cardinalityOf(effect) === 'many') {
-      store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false });
+      store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false, batch: true });
       store.bump(sid, 'ask');
       audit({ event: 'ask', sid, tool: exec.name, class: klass.key, autoEligible: false, why: 'batch' });
       return guardAsk(exec.agent, askDecision(`capgate: ${label}（批量或通配目标，需人工确认）`, label), label);
@@ -366,7 +395,9 @@ export function apply(ctx, config = {}) {
         return next();
       }
 
-      store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false, source: 'human', op: klass.op });
+      store.rememberPending(sid, exec.callId, {
+        key: klass.key, label, autoEligible: false, source: 'human', op: klass.op, opaque: !!effect.opaque,
+      });
       store.bump(sid, 'ask');
       audit({
         event: 'ask', sid, tool: exec.name, class: klass.key,
@@ -402,7 +433,9 @@ export function apply(ctx, config = {}) {
     }
 
     // 1.9 项目内但没引文
-    store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false, op: klass.op });
+    store.rememberPending(sid, exec.callId, {
+      key: klass.key, label, autoEligible: false, op: klass.op, opaque: !!effect.opaque,
+    });
     store.bump(sid, 'ask');
     audit({ event: 'ask', sid, tool: exec.name, class: klass.key, autoEligible: false, why: evidence.why });
     return guardAsk(exec.agent, askDecision(`capgate: 首次使用「${label}」，未找到用户原话依据（${evidence.why}）`, label), label);
@@ -484,14 +517,28 @@ export function apply(ctx, config = {}) {
     }
 
     const outcome = await next();
+    const sig = req.callId ? signatures.get(String(req.callId)) : undefined;
+    // 这三类批准只对"这一次"有效：批量、不透明执行、出网。
+    // 否则一次批准会变成"N 次同类许可证"，与它们的必问理由矛盾。
+    const perAction = pending.batch || pending.opaque || pending.op === 'send'
+      || String(pending.key).endsWith('|many') || String(pending.key).startsWith('send|');
     if (outcome === 'allowed-once') {
-      store.grant(sid, pending.key, { via: 'human' });
-      store.bump(sid, 'grant');
-      audit({ event: 'grant', by: 'human', sid, tool: req.toolName, class: pending.key });
+      if (perAction) {
+        store.bump(sid, 'allow');
+        audit({ event: 'allow', by: 'human-once', sid, tool: req.toolName, class: pending.key });
+      } else {
+        store.grant(sid, pending.key, { via: 'human' });
+        store.bump(sid, 'grant');
+        audit({ event: 'grant', by: 'human', sid, tool: req.toolName, class: pending.key });
+      }
+      // 只记住"这一条命令"，不推广到同类；下次同一条命令直接放行
+      if (sig) store.approveSignature(sid, sig);
     } else {
       store.deny(sid, pending.key);
       audit({ event: 'deny', by: 'human', outcome, sid, tool: req.toolName, class: pending.key });
+      if (sig) store.dropSignature(sid, sig);
     }
+    if (req.callId) signatures.delete(String(req.callId));
     // 学习：累计人的选择，供 /capgate learn 生成硬化候选
     observe(learned, pending.key, outcome === 'allowed-once' ? 'approve' : 'reject');
     persistLearn();
