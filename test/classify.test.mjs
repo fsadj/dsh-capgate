@@ -90,3 +90,14 @@ test('单行多段（; 分隔）里的删除也能识别', () => {
   const e = parseShell(script, ROOT);
   assert.equal(e.op, 'delete');
 });
+
+test('版本/帮助查询按读处理，不算不透明执行', () => {
+  for (const cmd of ['node --version', 'git --help', 'npm -v', 'python --version']) {
+    const e = parseShell(cmd, ROOT);
+    assert.equal(e.op, 'read', `${cmd} 应该是读`);
+    assert.equal(e.opaque, false, `${cmd} 不该被当成不透明执行`);
+  }
+  const real = parseShell('node scripts/build.mjs', ROOT);
+  assert.equal(real.op, 'execute');
+  assert.equal(real.opaque, true, '真跑脚本仍然是不透明执行');
+});

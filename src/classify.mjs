@@ -118,15 +118,21 @@ export function parseShell(command, cwd, depth = 0) {
   const hasVerb = (set) => verbs.some((v) => set.has(v));
   const redirects = REDIRECT_RE.test(text);
 
-  const op = hasVerb(CMD_SETS.send) ? 'send'
+  const rawOp = hasVerb(CMD_SETS.send) ? 'send'
     : hasVerb(CMD_SETS.delete) ? 'delete'
     : (hasVerb(CMD_SETS.write) || redirects) ? 'write'
     : hasVerb(CMD_SETS.execute) ? 'execute'
     : 'read';
 
+  // `node --version` / `git --help` 这类只查版本、不跑脚本的调用，
+  // 效果等于"读环境信息"，按读处理；否则会被当成不透明执行、每次都问。
+  const PLAIN_QUERY = /^\s*(?:node|nodejs|python3?|deno|bun|ruby|perl|php|java|go|cargo|npm|pnpm|yarn|git|docker|kubectl|pwsh|powershell)\s+(?:--?v(?:ersion)?|--?h(?:elp)?)\s*;?\s*$/i;
+  const plainQuery = !redirects && PLAIN_QUERY.test(text);
+  const op = plainQuery ? 'read' : rawOp;
+
   // 不透明执行：跑解释器/脚本时，真实效果（可能联网、写盘、删东西）藏在脚本里，
   // 命令文本看不出来。这类一律当作"未知效果"，不允许模型复核直接放行。
-  const opaque = op === 'execute' && verbs.some((v) => CMD_SETS.interpreter.has(v));
+  const opaque = !plainQuery && op === 'execute' && verbs.some((v) => CMD_SETS.interpreter.has(v));
 
   // 循环/管道驱动的删除与写入，目标集合在运行时才确定 → 按"批量"处理。
   // 但必须要求"删除动作本身"在循环里或由管道喂进来，且动词要有词边界

@@ -118,6 +118,25 @@ test('不透明执行不能被"跑一下"这类引文自动授权', async () => 
   assert.equal(decision.kind, 'ask', '引文不能替脚本内部效果背书');
 });
 
+test('疑问句不构成执行授权', async () => {
+  // 留出集里发现的漏洞：execute 的引文核对原来是裸关键词，"要跑构建吗？"也被当成指令
+  const h = harness('要跑构建吗？');
+  const { decision } = await h.call('pwsh', { command: 'npm run build' });
+  assert.equal(decision.kind, 'ask');
+});
+
+test('把命令原样念一遍不算指令', async () => {
+  const h = harness('npm run build');
+  const { decision } = await h.call('pwsh', { command: 'npm run build' });
+  assert.equal(decision.kind, 'ask');
+});
+
+test('明确说"跑一下构建"则放行', async () => {
+  const h = harness('跑一下 npm run build');
+  const { decision } = await h.call('pwsh', { command: 'npm run build' });
+  assert.equal(decision.kind, 'allow');
+});
+
 test('普通写：复核 allow + judgeAutoAllow → 直接放行，不弹卡片', async () => {
   const h = harness('跑一下测试', { judgeMode: 'residual', judgeAutoAllow: true }, undefined, fakeLlm('allow'));
   const { decision } = await h.call('write', { file_path: 'notes.md' });

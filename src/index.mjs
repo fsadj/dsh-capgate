@@ -12,7 +12,7 @@
  */
 import Schema from '@deepseek-ai/schemastery';
 import { effectOf, classify, describeClass, cardinalityOf } from './classify.mjs';
-import { collectInstructionTexts, findCitation, citationSupports, extractEntities } from './citations.mjs';
+import { collectInstructionTexts, findCitation, citationSupports, isInterrogative, extractEntities } from './citations.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
 import { loadState, saveState, observe, candidates, addRule, removeRule, hasRule } from './learn.mjs';
@@ -144,8 +144,15 @@ export function apply(ctx, config = {}) {
     }
 
     if (effect.op === 'execute') {
-      const hit = texts.find((t) => /(跑|运行|执行|构建|测试|编译|安装|run|build|test|exec|compile|install)/i.test(t.text));
-      if (!hit) return { ok: false, why: 'no instruction about running commands' };
+      const raw = String(effect.raw ?? '').trim();
+      const hit = texts.find((t) => {
+        const sentence = String(t.text ?? '').trim();
+        // 把命令原样念一遍不算指令；疑问句（"要跑构建吗？"）也不算授权
+        if (!sentence || sentence === raw) return false;
+        if (isInterrogative(sentence)) return false;
+        return /(跑|运行|执行|构建|测试|编译|安装|run|build|test|exec|compile|install)/i.test(sentence);
+      });
+      if (!hit) return { ok: false, why: 'no imperative instruction about running commands' };
       return { ok: true, citations: [], primary: { text: '(command)', sentence: hit.text.slice(0, 120), seq: hit.seq } };
     }
 

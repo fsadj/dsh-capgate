@@ -108,6 +108,15 @@ export function findCitation(texts, target) {
   return undefined;
 }
 
+/** 这句话是不是"疑问语气"（疑问本身不构成授权，除非同时带明确指令词）。 */
+export function isInterrogative(hay) {
+  const text = String(hay ?? '');
+  const askWord = /(要不要|是不是该|是否|能不能|可不可以|行不行|should\s+(i|we)|can\s+(i|we)|would\s+you\s+like)/i.test(text);
+  const questionMark = /[?？]\s*$/.test(text.trim());
+  const imperative = /(请|帮我|麻烦|直接|立刻|马上|务必|please|go ahead|just)\b/i.test(text);
+  return (askWord || questionMark) && !imperative;
+}
+
 /** 引文是否支持这个效果类（动词匹配；删/外发额外要求非疑问语气）。 */
 export function citationSupports(citation, klass) {
   if (!citation) return false;
@@ -116,10 +125,9 @@ export function citationSupports(citation, klass) {
   if (!verbs.test(hay)) return false;
 
   // 疑问句不是授权："要不要删掉 src/app.js" 不构成删除授权
-  const interrogative = /(要不要|是不是该|是否|能不能|可不可以|行不行|should\s+(i|we)|can\s+(i|we)|would\s+you\s+like)/i.test(hay);
-  const imperative = /(请|帮我|麻烦|直接|立刻|马上|务必|please|go ahead|just)\b/i.test(hay);
-  if (interrogative && !imperative) return false;
+  if (isInterrogative(hay)) return false;
 
+  const imperative = /(请|帮我|麻烦|直接|立刻|马上|务必|please|go ahead|just)\b/i.test(hay);
   if ((klass.op === 'delete' || klass.op === 'send') && /[?？]\s*$/.test(hay) && !imperative) return false;
 
   if (klass.scope.startsWith('outside') && klass.op !== 'send') {
