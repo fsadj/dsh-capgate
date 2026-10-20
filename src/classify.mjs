@@ -109,6 +109,11 @@ export function parseShell(command, cwd, depth = 0) {
   const wrapped = depth < 4 && SHELL_WRAP.test(text);
   if (wrapped) text = text.replace(SHELL_WRAP, (_m, _q, inner) => String(inner));
 
+  // `cmd /c del ...`、`powershell -c "..."`：内层命令带不带引号都要拆开，
+  // 否则整条会被当成一个叫 cmd 的执行、把里面的删除藏起来。
+  const UNQUOTED_WRAP = /^\s*(?:cmd(?:\.exe)?\s+\/[ck]|(?:powershell|pwsh)(?:\.exe)?\s+(?:-c|-command)|bash\s+-c)\s+([\s\S]+)$/i;
+  if (depth < 4) text = text.replace(UNQUOTED_WRAP, (_m, inner) => String(inner));
+
   // 按段取第一个词判动词：`Get-Content cordis.patch.yml` 是读，不是写
   const verbs = text
     .split(SEGMENT_SPLIT)
@@ -118,16 +123,30 @@ export function parseShell(command, cwd, depth = 0) {
   const hasVerb = (set) => verbs.some((v) => set.has(v));
   const redirects = REDIRECT_RE.test(text);
 
-  const rawOp = hasVerb(CMD_SETS.send) ? 'send'
-    : hasVerb(CMD_SETS.delete) ? 'delete'
-    : (hasVerb(CMD_SETS.write) || redirects) ? 'write'
-    : hasVerb(CMD_SETS.execute) ? 'execute'
-    : 'read';
+  // 没有"动词"的删除：.NET API、robocopy /MOV（移动 = 删源）
+  const API_DELETE = /\]::Delete(?:Directory|File)?\s*\(/i.test(text)
+    || /\bSystem\.IO\b[\s\S]{0,40}\bDelete(?:Directory|File)?\s*\(/i.test(text);
+  const ROBO_MOVE = /\brobocopy\b[^;|&]*\/(?:mov|move)\b/i.test(text);
 
   // `node --version` / `git --help` 这类只查版本、不跑脚本的调用，
   // 效果等于"读环境信息"，按读处理；否则会被当成不透明执行、每次都问。
   const PLAIN_QUERY = /^\s*(?:node|nodejs|python3?|deno|bun|ruby|perl|php|java|go|cargo|npm|pnpm|yarn|git|docker|kubectl|pwsh|powershell)\s+(?:--?v(?:ersion)?|--?h(?:elp)?)\s*;?\s*$/i;
   const plainQuery = !redirects && PLAIN_QUERY.test(text);
+
+  // 一个动词都没认出来 → **不许当读**。
+  // 这是三次真实漏放的共同根因：`.NET API`、`robocopy /MOV`、`cmd /c del` 都因为
+  // "没匹配到动词"退化成 read，然后被"项目外普通读"快路静默放行。
+  // 未知命令一律降到 'other'，交给"问人"而不是"放行"。
+  const anyKnownVerb = hasVerb(CMD_SETS.send) || hasVerb(CMD_SETS.delete)
+    || hasVerb(CMD_SETS.write) || hasVerb(CMD_SETS.execute) || hasVerb(CMD_SETS.read);
+  const unknown = !plainQuery && !API_DELETE && !ROBO_MOVE && !anyKnownVerb;
+  const rawOp = (API_DELETE || ROBO_MOVE) ? 'delete'
+    : hasVerb(CMD_SETS.send) ? 'send'
+    : hasVerb(CMD_SETS.delete) ? 'delete'
+    : (hasVerb(CMD_SETS.write) || redirects) ? 'write'
+    : hasVerb(CMD_SETS.execute) ? 'execute'
+    : unknown ? 'other'
+    : 'read';
   const op = plainQuery ? 'read' : rawOp;
 
   // 不透明执行：跑解释器/脚本时，真实效果（可能联网、写盘、删东西）藏在脚本里，

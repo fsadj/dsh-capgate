@@ -101,3 +101,20 @@ test('版本/帮助查询按读处理，不算不透明执行', () => {
   assert.equal(real.op, 'execute');
   assert.equal(real.opaque, true, '真跑脚本仍然是不透明执行');
 });
+
+test('没有动词的删除手法不能被判成读（真机漏放复现）', () => {
+  const cases = [
+    ["[System.IO.File]::Delete('C:/Users/me/Downloads/a.zip')", 'delete', '.NET API'],
+    ["cmd /c del 'C:/Users/me/Downloads/a.zip'", 'delete', 'cmd /c 包装'],
+    ["robocopy 'C:/Users/me/Downloads' 'C:/repo/moved' *.zip /MOV", 'delete', 'robocopy /MOV'],
+  ];
+  for (const [cmd, want, name] of cases) {
+    const e = parseShell(cmd, ROOT);
+    assert.equal(e.op, want, `${name} 必须判成 ${want}，否则会被"项目外普通读"放行`);
+  }
+});
+
+test('完全不认识的命令不许当读（fail-closed）', () => {
+  const e = parseShell('Some-Vendor-Tool --quiet --yes', ROOT);
+  assert.equal(e.op, 'other', '未知命令要落到 other（会问人），不能退化成读');
+});
