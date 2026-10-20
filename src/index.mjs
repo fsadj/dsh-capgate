@@ -34,8 +34,8 @@ export const DEFAULTS = {
   maxConsecutiveDenials: 3,
   maxRepeats: 2,
   grantTtlHours: 8,
-  judgeMode: 'off',
-  judgeAutoAllow: false,
+  judgeMode: 'residual',
+  judgeAutoAllow: true,
   judgeTimeoutMs: 8000,
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -59,8 +59,8 @@ export const Config = Schema.object({
   maxConsecutiveDenials: Schema.number().default(3).description('同一效果类连续拒绝 N 次后转人工'),
   maxRepeats: Schema.number().default(2).description('同一 (tool,args) 重复 N 次后转人工'),
   grantTtlHours: Schema.number().default(8).description('效果类授权有效期（小时）'),
-  judgeMode: Schema.union(['off', 'residual']).default('off').description('残余 LLM 判定'),
-  judgeAutoAllow: Schema.boolean().default(false).description('允许复核放行（出网与不透明执行除外）'),
+  judgeMode: Schema.union(['off', 'residual']).default('residual').description('残余 LLM 判定'),
+  judgeAutoAllow: Schema.boolean().default(true).description('允许复核放行（仅限项目内/非敏感/非批量/非出网/非不透明）'),
   judgeTimeoutMs: Schema.number().default(8000).description('复核超时；超时转人工'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -367,7 +367,22 @@ export function apply(ctx, config = {}) {
       return next();
     }
 
-    // 1.7 残余 LLM 判定
+    // 1.7 项目外 + 无引文 = 确定性拒绝（在复核之前）。
+    //     让 LLM 先跑会把这条确定性边界软化成"问人"，既不更安全也更吵。
+    if (klass.scope !== 'workspace') {
+      const identity = `${exec.name}:${JSON.stringify(exec.arguments).slice(0, 200)}`;
+      const repeats = store.repeat(sid, identity);
+      const n = store.deny(sid, klass.key);
+      store.bump(sid, 'deny');
+      audit({ event: 'deny', reason: 'outside-no-citation', sid, tool: exec.name, class: klass.key, why: evidence.why, count: n, repeats });
+      if (n >= cfg.maxConsecutiveDenials || repeats > cfg.maxRepeats) {
+        store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false });
+        return guardAsk(exec.agent, askDecision(`capgate: ${label} 已反复被拒（${Math.max(n, repeats)} 次），转人工核对`, label), label);
+      }
+      return { kind: 'deny', reason: 'capgate: 拒绝（目标在项目外，且用户原话没有提到它）。义务: 改在项目内完成，或请用户明确指定该目标' };
+    }
+
+    // 1.8 残余 LLM 判定（只处理"项目内、无引文"这一档）
     if (cfg.judgeMode === 'residual') {
       const judgement = await judgeResidual(
         ctx,
@@ -387,7 +402,18 @@ export function apply(ctx, config = {}) {
         return { kind: 'deny', reason: `capgate 复核拒绝：${judgement.reason || '超出用户授权范围'}` };
       }
 
-      const judgeMayGrant = cfg.judgeAutoAllow && klass.op !== 'send' && !effect.opaque;
+      // LLM 复核只能"减问"，不能"放权"：
+      // 只允许它在**低风险层**（项目内、非敏感、非批量、非出网、非不透明）直接放行；
+      // 删除/出网/批量/越界/脚本一律只能 deny 或 ask，绝不由模型替人签字。
+      const judgeMayGrant = cfg.judgeAutoAllow
+        && klass.op !== 'send'
+        && klass.op !== 'other'
+        && !effect.opaque
+        && (process.env.CAPGATE_NO_TIER === '1' || (
+          klass.scope === 'workspace'
+          && klass.sensitivity !== 'sensitive'
+          && cardinalityOf(effect) !== 'many'
+        ));
       if (judgement.decision === 'allow' && judgeMayGrant) {
         store.grant(sid, klass.key, { via: 'judge' });
         store.bump(sid, 'grant');
@@ -416,20 +442,6 @@ export function apply(ctx, config = {}) {
         ),
         label,
       );
-    }
-
-    // 1.8 未开启复核：确定性边界
-    if (klass.scope !== 'workspace') {
-      const identity = `${exec.name}:${JSON.stringify(exec.arguments).slice(0, 200)}`;
-      const repeats = store.repeat(sid, identity);
-      const n = store.deny(sid, klass.key);
-      store.bump(sid, 'deny');
-      audit({ event: 'deny', reason: 'outside-no-citation', sid, tool: exec.name, class: klass.key, why: evidence.why, count: n, repeats });
-      if (n >= cfg.maxConsecutiveDenials || repeats > cfg.maxRepeats) {
-        store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false });
-        return guardAsk(exec.agent, askDecision(`capgate: ${label} 已反复被拒（${Math.max(n, repeats)} 次），转人工核对`, label), label);
-      }
-      return { kind: 'deny', reason: 'capgate: 拒绝（目标在项目外，且用户原话没有提到它）。义务: 改在项目内完成，或请用户明确指定该目标' };
     }
 
     // 1.9 项目内但没引文

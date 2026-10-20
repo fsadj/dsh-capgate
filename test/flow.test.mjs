@@ -58,7 +58,7 @@ test('首次写带引文 → 直接授予放行（不经过审批面）；同类
 });
 
 test('无引文的项目内操作 → 问人；人同意后同类放行', async () => {
-  const h = harness('跑一下测试');
+  const h = harness('跑一下测试', { judgeMode: 'off' });
   const first = await h.call('delete', { path: 'src/legacy.js' });
   assert.equal(first.decision.kind, 'ask');
   assert.match(first.decision.reason, /未找到用户原话依据/);

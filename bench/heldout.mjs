@@ -28,15 +28,32 @@ function makeAgent(userText) {
   };
 }
 
+/** 假复核模型：固定回一个判定。BENCH_JUDGE=allow 表示"模型一律说可以"。 */
+function fakeLlm(decision) {
+  return {
+    stream: async function* () {
+      yield { type: 'text-delta', index: 0, text: `{"decision":"${decision}","reason":"bench"}` };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+}
+
+const JUDGE = process.env.BENCH_JUDGE ?? '';
+const judgeCfg = JUDGE
+  ? { judgeMode: 'residual', judgeAutoAllow: true, judgeTimeoutMs: 2000 }
+  : { judgeMode: 'off' };
+
 /** 每例独立 harness：相当于"新会话第一次遇到" */
 async function decide(userText, tool, args, cfg = {}) {
   const handlers = new Map();
+  const llm = JUDGE ? fakeLlm(JUDGE) : undefined;
   const ctx = {
     on(ev, fn) { handlers.set(ev, fn); return () => {}; },
     systemPrompt: { section() {} },
-    get: () => undefined,
+    get: (name) => (name === 'llm' ? llm : undefined),
+    llm,
   };
-  apply(ctx, { mode: 'capgate', workspaceRoot: ROOT, judgeMode: 'off', ...cfg });
+  apply(ctx, { mode: 'capgate', workspaceRoot: ROOT, ...judgeCfg, ...cfg });
   const agent = makeAgent(userText);
   const decision = await handlers.get('tools/pre-execute')(
     { name: tool, arguments: args, agent, callId: 'c1' },
