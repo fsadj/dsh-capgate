@@ -18,6 +18,7 @@ import { minimizeOptions, describeMinimize } from './minimize.mjs';
 import { verify, summarizeFacts, buildAskPrompt, parseAsk, renderAsk, factList } from './verifier.mjs';
 import { inspectScript } from './scriptaudit.mjs';
 import { findReadContent, hashText } from './readlog.mjs';
+import { collectProvenance, allCreated, allRead } from './provenance.mjs';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { parseIntent, extractIntent, callModel } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
@@ -53,6 +54,7 @@ export const DEFAULTS = {
   verifierScope: 'workspace',
   scriptAudit: 'on',
   verifierAsk: 'on',
+  provenanceMode: 'on',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -86,6 +88,7 @@ export const Config = Schema.object({
   verifierScope: Schema.union(['workspace', 'any']).default('workspace').description('核查探针的范围：默认只看工作区（软链解析后）'),
   scriptAudit: Schema.union(['off', 'on']).default('on').description('脚本可读化：静态检查无危险 API 的脚本可按引文放行'),
   verifierAsk: Schema.union(['off', 'on']).default('on').description('询问时由独立 verifier 生成四段式问题（只能收紧）'),
+  provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -572,6 +575,24 @@ export function apply(ctx, config = {}) {
       store.bump(sid, 'grant');
       store.bump(sid, 'citation'); audit({ event: 'grant', by: 'citation', sid, tool: exec.name, class: klass.key, cited: evidence.primary.text });
       return next();
+    }
+
+    // 1.6a 来源事实：目标如果是**本任务里 agent 自己创建**的，删/改它不必反复打断。
+    //      只对已放行过的工具调用生效；敏感路径在上面已经拦掉了，走不到这里。
+    if (!evidence.ok && cfg.provenanceMode === 'on' && ['read', 'write', 'delete'].includes(klass.op)) {
+      const pathTargets = effect.targets.filter((t) => t.kind === 'path').map((t) => t.value);
+      if (pathTargets.length > 0) {
+        const prov = collectProvenance(exec.agent, { cwd });
+        const owned = klass.op === 'read' ? allRead(prov, pathTargets, cwd) : allCreated(prov, pathTargets, cwd);
+        if (owned) {
+          store.bump(sid, 'reuse');
+          audit({
+            event: 'allow', by: 'provenance', sid, tool: exec.name, class: klass.key,
+            targets: pathTargets.slice(0, 5), op: klass.op,
+          });
+          return next();
+        }
+      }
     }
 
     // 1.6b 语义引文：原文没逐字提到，但模型从原话里抽出的契约条目覆盖了这次调用。
