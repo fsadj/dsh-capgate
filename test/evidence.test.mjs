@@ -1,4 +1,4 @@
-﻿import { test } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { splitSegments, instructionOnly, collectEvidence, locateSpan, renderContract, instructionCorpus, validateIntent, effectiveEntries } from '../src/evidence.mjs';
 
@@ -86,4 +86,26 @@ test('同 (op,target) 后来者覆盖先前者', () => {
   assert.equal(eff.length, 2);
   assert.equal(eff[0].seq, 2, 'delete/a.zip 取最后一条');
   assert.equal(eff[1].op, 'read');
+});
+
+test('采集最近若干轮"指令→回复"对（回复只作上下文）', () => {
+  const events = [
+    { type: 'user/message', data: { source: { kind: 'user', rpcId: 'm0' }, content: [{ type: 'text', text: '清理下载目录' }] } },
+    { type: 'assistant/message', data: { content: [{ type: 'text', text: '好的，我会删除 Downloads 下的 zip 文件' }] } },
+    { type: 'user/message', data: { source: { kind: 'user', rpcId: 'm1' }, content: [{ type: 'text', text: '那个大一点的也删掉' }] } },
+    { type: 'assistant/message', data: { content: [{ type: 'text', text: '明白，删除 dataset.zip' }] } },
+  ];
+  const agent = {
+    session: {
+      id: 'sess-turns',
+      header: { cwd: 'C:/repo' },
+      surface: { nodes: events.map((_, i) => i) },
+      snapshotEvents: () => events,
+    },
+  };
+  const ev = collectEvidence(agent, { window: 'session', turns: 5 });
+  assert.equal(ev.turns.length, 2);
+  assert.match(ev.turns[0].assistant, /删除 Downloads/);
+  assert.match(ev.turns[1].user, /那个大一点的/);
+  assert.equal(locateSpan(ev, 'Downloads'), undefined, '模型回复里的路径不能当引文');
 });

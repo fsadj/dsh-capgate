@@ -48,12 +48,15 @@ export function instructionOnly(text) {
 }
 
 /**
- * 采集任务证据：原文 + 切分 + 人给的标签。
- * taskId 默认等于 session id；宿主能给真实任务边界时应覆盖它（config.taskId）。
+ * 采集任务证据：原文 + 切分 + 人给的标签 + 最近若干轮"指令→回复"对。
+ *
+ * 回复（assistant）只用来**消除指代**，永远不能当授权：
+ * 授权条目的 quote 只能在 user 的 instruction span 里定位。
  */
-export function collectEvidence(agent, { labels = [], taskId = '', window = 'latest' } = {}) {
+export function collectEvidence(agent, { labels = [], taskId = '', window = 'latest', turns = 5 } = {}) {
   const sessionId = String(agent?.session?.id ?? 'anonymous');
-  const out = { taskId: taskId || sessionId, instructions: [], labels: [] };
+  const out = { taskId: taskId || sessionId, instructions: [], labels: [], turns: [] };
+  const pendingTurns = [];
   try {
     const session = agent?.session;
     if (!session) return out;
@@ -61,13 +64,27 @@ export function collectEvidence(agent, { labels = [], taskId = '', window = 'lat
     const events = session.snapshotEvents();
     for (const seq of nodes) {
       const ev = events[seq];
-      if (!ev || ev.type !== 'user/message') continue;
-      const src = ev.data?.source ?? {};
-      if (src.kind !== 'user' && src.kind !== 'agent-message') continue;
-      const text = (ev.data?.content ?? [])
+      if (!ev) continue;
+
+      const textOf = (content) => (content ?? [])
         .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
         .map((b) => b.text)
         .join('\n');
+
+      // 模型对用户的回复：只进入上下文，不进入授权
+      if (ev.type === 'assistant/message') {
+        const reply = textOf(ev.data?.content);
+        if (reply.trim()) {
+          if (pendingTurns.length > 0) pendingTurns[pendingTurns.length - 1].assistant = reply;
+          else pendingTurns.push({ user: '', assistant: reply });
+        }
+        continue;
+      }
+
+      if (ev.type !== 'user/message') continue;
+      const src = ev.data?.source ?? {};
+      if (src.kind !== 'user' && src.kind !== 'agent-message') continue;
+      const text = textOf(ev.data?.content);
       if (!text.trim()) continue;
       out.instructions.push({
         msgId: String(src.rpcId ?? `seq-${seq}`),
@@ -76,10 +93,13 @@ export function collectEvidence(agent, { labels = [], taskId = '', window = 'lat
         text,
         segments: splitSegments(text),
       });
+      pendingTurns.push({ user: text, assistant: '' });
     }
   } catch {
     // 会话面不可读 → 证据为空 → 后续一律转人工，绝不因此放行
   }
+
+  out.turns = pendingTurns.filter((t) => t.user || t.assistant).slice(-Math.max(1, Number(turns) || 5));
   // 任务边界：默认只看最后一条用户指令。
   // 不加这条，上一个任务的授权会漏到下一个任务里（真机上已经发生过一次）。
   if (window === 'latest' && out.instructions.length > 1) {

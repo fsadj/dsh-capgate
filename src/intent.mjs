@@ -77,7 +77,7 @@ export async function compileEffects(ctx, agent, call, { timeoutMs = 8000 } = {}
 
 /* ───────────────────────── 意图抽取（语义，不是正则） ───────────────────────── */
 
-export function buildIntentPrompt(instructions) {
+export function buildIntentPrompt(instructions, context = '') {
   return [
     'You read a user\'s instructions and write down the MINIMUM data access they authorize.',
     'Return ONLY JSON: {"entries":[{"op":"read|write|delete|send|execute","target":"<literal path or host>","quote":"<exact substring copied from the instructions>"}],"residual":false}',
@@ -89,8 +89,11 @@ export function buildIntentPrompt(instructions) {
     '- If the user did not authorize any concrete data access, return {"entries":[],"residual":true}.',
     '- residual=true when the instruction is too vague to derive literal targets.',
     '',
-    'INSTRUCTIONS:',
+    'INSTRUCTIONS (authorization source — quote MUST come from here):',
     instructions,
+    '',
+    'ASSISTANT CONTEXT (NOT authorization; use only to resolve what the user is referring to):',
+    context || '(none)',
   ].join('\n');
 }
 
@@ -117,11 +120,11 @@ export function parseIntent(text) {
 }
 
 /** 调模型抽一次意图。 */
-export async function extractIntent(ctx, agent, instructions, { timeoutMs = 12000 } = {}) {
+export async function extractIntent(ctx, agent, instructions, { context = '', timeoutMs = 12000 } = {}) {
   if (!String(instructions ?? '').trim()) return undefined;
   const text = await callModel(ctx, agent, {
     system: 'You extract the minimum authorized data access from instructions. Output JSON only.',
-    prompt: buildIntentPrompt(instructions),
+    prompt: buildIntentPrompt(instructions, context),
     timeoutMs,
   });
   return text === undefined ? undefined : parseIntent(text);

@@ -45,6 +45,7 @@ export const DEFAULTS = {
   verifyMode: 'on',
   intentMode: 'on',
   evidenceWindow: 'latest',
+  evidenceTurns: 5,
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -74,6 +75,7 @@ export const Config = Schema.object({
   verifyMode: Schema.union(['off', 'on']).default('on').description('独立核查：只读探针，只回事实'),
   intentMode: Schema.union(['off', 'on']).default('on').description('语义引文：从原话抽取契约条目'),
   evidenceWindow: Schema.union(['latest', 'session']).default('latest').description('授权证据窗口：只看最后一条指令（默认）或整个会话'),
+  evidenceTurns: Schema.number().default(5).description('送给意图抽取的最近对话轮数（只用于消歧，不构成授权）'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -259,14 +261,15 @@ export function apply(ctx, config = {}) {
   const intentCache = new Map();
 
   async function ensureIntent(agent, sid) {
-    const ev = collectEvidence(agent, { taskId: cfg.taskId, window: cfg.evidenceWindow });
+    const ev = collectEvidence(agent, { taskId: cfg.taskId, window: cfg.evidenceWindow, turns: cfg.evidenceTurns });
     const corpus = ev.instructions.map((m) => instructionOnly(m.text)).filter(Boolean).join('\n');
     if (!corpus.trim()) return [];
     const hash = `${corpus.length}:${corpus.slice(0, 60)}:${corpus.slice(-60)}`;
     const cached = intentCache.get(sid);
     if (cached && cached.hash === hash) return cached.entries;
 
-    const parsed = await extractIntent(ctx, agent, corpus, { timeoutMs: Math.max(4000, cfg.judgeTimeoutMs * 2) });
+    const context = ev.turns.map((t) => [t.user && ('USER: ' + t.user), t.assistant && ('ASSISTANT: ' + t.assistant)].filter(Boolean).join('\n')).join('\n---\n');
+    const parsed = await extractIntent(ctx, agent, corpus, { context, timeoutMs: Math.max(4000, cfg.judgeTimeoutMs * 2) });
     if (!parsed) {
       intentCache.set(sid, { hash, entries: [] });
       return [];
@@ -849,7 +852,8 @@ export function apply(ctx, config = {}) {
     const corpus = ev.instructions.map((m) => instructionOnly(m.text)).filter(Boolean).join('\n');
     if (!corpus.trim()) return { kind: 'error', text: 'capgate: 本会话没有用户指令，无法抽取意图' };
 
-    const parsed = await extractIntent(ctx, invocation.agent, corpus, { timeoutMs: cfg.judgeTimeoutMs * 2 });
+    const context = ev.turns.map((t) => [t.user && ('USER: ' + t.user), t.assistant && ('ASSISTANT: ' + t.assistant)].filter(Boolean).join('\n')).join('\n---\n');
+    const parsed = await extractIntent(ctx, invocation.agent, corpus, { context, timeoutMs: cfg.judgeTimeoutMs * 2 });
     if (!parsed) return { kind: 'error', text: 'capgate: 意图抽取失败（模型不可用或输出不合规），按"无授权"处理' };
 
     const { accepted, rejected, residual } = validateIntent(ev, parsed);
