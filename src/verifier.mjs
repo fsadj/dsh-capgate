@@ -11,7 +11,7 @@
  *   - 只返回"事实"（命中数、大小、类型），不返回原文；
  *   - 调查失败 = 事实缺失 = 转人工，绝不静默。
  */
-import { readFileSync, statSync, readdirSync, existsSync } from 'node:fs';
+import { readFileSync, statSync, readdirSync, existsSync, realpathSync } from 'node:fs';
 import { basename } from 'node:path';
 
 const PII_PATTERNS = {
@@ -30,6 +30,18 @@ const SECRET_PATTERNS = {
 
 export const DEFAULT_BUDGET = { probes: 5, bytes: 262144, ms: 2000 };
 
+function inside(target, root) {
+  const t = String(target).replace(/\\/g, '/').toLowerCase();
+  const r = String(root ?? '').replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+  if (!r) return false;
+  return t === r || t.startsWith(`${r}/`);
+}
+
+/** 解析软链后再判作用域：否则工作区里的一个软链就能把探针带到外面。 */
+function realOf(p) {
+  try { return existsSync(p) ? realpathSync(p) : p; } catch { return p; }
+}
+
 function redactLine(line) {
   return String(line)
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, '[email]')
@@ -43,7 +55,7 @@ function redactLine(line) {
  * 一次核查：只产出事实，外加"拒绝/询问"的建议。
  * @returns {{facts:object[], probes:string[], recommendation?:'deny'|'ask', reason?:string, question?:object}}
  */
-export function verify(call, { budget = DEFAULT_BUDGET } = {}) {
+export function verify(call, { budget = DEFAULT_BUDGET, scope = { mode: 'workspace', root: '' } } = {}) {
   const started = Date.now();
   const facts = [];
   const probes = [];
@@ -52,10 +64,16 @@ export function verify(call, { budget = DEFAULT_BUDGET } = {}) {
   const canProbe = () => probes.length < budget.probes && spent < budget.bytes && Date.now() - started < budget.ms;
 
   const targets = (call?.targets ?? []).filter((t) => typeof t === 'string' && t);
+  const allowProbe = (target) => {
+    if (scope.mode !== 'workspace') return true;
+    if (!scope.root) return false;              // 没有根就不探（fail-closed）
+    return inside(realOf(target), scope.root);  // 软链解析后再比
+  };
   const op = String(call?.op ?? 'other');
 
   for (const target of targets.slice(0, 3)) {
     if (!canProbe()) break;
+    if (!allowProbe(target)) { facts.push({ type: 'scope.skipped', target }); continue; }
 
     // stat：存在性/大小/类型（最便宜）
     probes.push('stat');

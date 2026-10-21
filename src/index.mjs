@@ -46,6 +46,7 @@ export const DEFAULTS = {
   intentMode: 'on',
   evidenceWindow: 'latest',
   evidenceTurns: 5,
+  verifierScope: 'workspace',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -76,6 +77,7 @@ export const Config = Schema.object({
   intentMode: Schema.union(['off', 'on']).default('on').description('语义引文：从原话抽取契约条目'),
   evidenceWindow: Schema.union(['latest', 'session']).default('latest').description('授权证据窗口：只看最后一条指令（默认）或整个会话'),
   evidenceTurns: Schema.number().default(5).description('送给意图抽取的最近对话轮数（只用于消歧，不构成授权）'),
+  verifierScope: Schema.union(['workspace', 'any']).default('workspace').description('核查探针的范围：默认只看工作区（软链解析后）'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -514,6 +516,43 @@ export function apply(ctx, config = {}) {
       };
     }
 
+    // 1.8b 独立核查：只在"看不懂/不透明/要外发"时做，只读、有预算、只回事实。
+    //      verifier 可以直接拒绝（收紧自由），但**不能放行**——放行仍要过策略。
+    let verifyNote = '';
+    const verifyWorthy = cfg.verifyMode === 'on' && (
+      ['other', 'send', 'execute'].includes(klass.op)
+      || (klass.op === 'read' && klass.scope !== 'workspace')
+    );
+    if (verifyWorthy) {
+      try {
+        const checked = verify({
+          op: klass.op,
+          targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
+        }, { scope: { mode: cfg.verifierScope, root: cwd } });
+        console.log('[capgate] verify ' + klass.op + ' probes=[' + checked.probes.join(',') + '] facts=' + checked.facts.length + ' skip=' + checked.facts.filter((f) => f.type === 'scope.skipped').length);
+        if (checked.facts.length > 0) {
+          const summary = summarizeFacts(checked);
+          verifyNote = summary;
+          audit({ event: 'verify', sid, tool: exec.name, class: klass.key, probes: checked.probes, facts: summary });
+        }
+        if (checked.recommendation === 'deny') {
+          const opts = minimizeOptions({
+            op: klass.op,
+            targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
+          });
+          store.bump(sid, 'deny');
+          audit({ event: 'deny', by: 'verifier', sid, tool: exec.name, class: klass.key, reason: checked.reason });
+          return {
+            kind: 'deny',
+            reason: `capgate: ${checked.reason}。${checked.facts.length ? `（${summary}）\n` : '\n'}${describeMinimize(opts)}`,
+            alternatives: opts.map((o) => o.label),
+          };
+        }
+      } catch (err) {
+        audit({ event: 'verify_failed', sid, tool: exec.name, reason: String(err && err.message ? err.message : err) });
+      }
+    }
+
     // 1.7b "看不懂的调用"交给效果编译器：模型只负责**翻译**成字面效果，
     //      放行/询问/拒绝仍由下面的确定性规则决定。
     if (klass.op === 'other' && cfg.judgeMode === 'residual') {
@@ -583,6 +622,7 @@ export function apply(ctx, config = {}) {
       }
     }
 
+
     // 1.8 残余 LLM 判定（只处理"项目内、无引文"这一档）
     if (cfg.judgeMode === 'residual') {
       const judgement = await judgeResidual(
@@ -648,42 +688,6 @@ export function apply(ctx, config = {}) {
       );
     }
 
-    // 1.9 项目内但没引文
-    // 1.8b 独立核查：只在"看不懂/不透明/要外发"时做，只读、有预算、只回事实。
-    //      verifier 可以直接拒绝（收紧自由），但**不能放行**——放行仍要过策略。
-    let verifyNote = '';
-    const verifyWorthy = cfg.verifyMode === 'on' && (
-      ['other', 'send', 'execute'].includes(klass.op)
-      || (klass.op === 'read' && klass.scope !== 'workspace')
-    );
-    if (verifyWorthy) {
-      try {
-        const checked = verify({
-          op: klass.op,
-          targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
-        });
-        if (checked.facts.length > 0) {
-          const summary = summarizeFacts(checked);
-          verifyNote = summary;
-          audit({ event: 'verify', sid, tool: exec.name, class: klass.key, probes: checked.probes, facts: summary });
-        }
-        if (checked.recommendation === 'deny') {
-          const opts = minimizeOptions({
-            op: klass.op,
-            targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
-          });
-          store.bump(sid, 'deny');
-          audit({ event: 'deny', by: 'verifier', sid, tool: exec.name, class: klass.key, reason: checked.reason });
-          return {
-            kind: 'deny',
-            reason: `capgate: ${checked.reason}。${checked.facts.length ? `（${summary}）\n` : '\n'}${describeMinimize(opts)}`,
-            alternatives: opts.map((o) => o.label),
-          };
-        }
-      } catch (err) {
-        audit({ event: 'verify_failed', sid, tool: exec.name, reason: String(err && err.message ? err.message : err) });
-      }
-    }
 
     // 1.9 项目内但没引文
     store.rememberPending(sid, exec.callId, {
