@@ -22,7 +22,7 @@ import { collectProvenance, allCreated, allRead } from './provenance.mjs';
 import { judgeCoverage } from './coverage.mjs';
 import { absoluteDanger, resolveEffect } from './effects.mjs';
 import { reviewWithAgent } from './reviewer.mjs';
-import { existsSync, statSync, readFileSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { parseIntent, extractIntent, callModel } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
@@ -61,6 +61,7 @@ export const DEFAULTS = {
   coverageMode: 'on',
   readGate: 'shadow',
   reviewerMode: 'agent',
+  benchOut: '',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -97,6 +98,7 @@ export const Config = Schema.object({
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
   readGate: Schema.union(['off', 'shadow', 'on']).default('shadow').description('读闸门：shadow=只记录词法与语义是否一致；on=语义不同意就不放行'),
+  benchOut: Schema.string().default('').description('评测用：设置后第一次工具调用时跑纯 agent 评测并写入该文件'),
   reviewerMode: Schema.union(['off', 'agent']).default('agent').description('审查由独立 subagent 承担（只读工具 + 结构化输出）；不可用时自动退回提示词审查'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
@@ -277,6 +279,7 @@ export function apply(ctx, config = {}) {
   // ---- 1. 判定 ----
   // 休眠不是"静默"：一旦因为模式/预设不匹配而不接管，至少留一条审计，
   // 否则事后看日志会分不清"插件没拦"和"插件没在看"。
+  let benchStarted = false;
   const dormantSeen = new Set();
   const schemaSeen = new Set();
 
@@ -493,6 +496,17 @@ export function apply(ctx, config = {}) {
     }
 
     const sid = sidOf(exec.agent);
+
+    // 评测开关：第一次工具调用时在运行时内跑纯 agent 评测，结果写文件。
+    if (cfg.benchOut && !benchStarted) {
+      benchStarted = true;
+      setTimeout(() => {
+        runAgentBench({ agent: exec.agent })
+          .then((r) => { try { writeFileSync(cfg.benchOut, r.text, 'utf8'); } catch (e) { console.log('[capgate] bench write failed: ' + (e && e.message)); } })
+          .catch((e) => { console.log('[capgate] bench failed: ' + (e && e.message ? e.message : e)); })
+          .finally(() => { console.log('[capgate] agentbench finished -> ' + cfg.benchOut); });
+      }, 500);
+    }
 
     // 0. 绝对危险：词法层唯一保留的否决权。
     //    命中即拒绝，不进入后续任何"可以商量"的路径；规则 id 进审计，可解释。
@@ -1153,6 +1167,17 @@ export function apply(ctx, config = {}) {
     if (!['read', 'grep', 'glob', 'list', 'view'].includes(exec.name)) return next();
     try {
       const sid = sidOf(exec.agent);
+
+    // 评测开关：第一次工具调用时在运行时内跑纯 agent 评测，结果写文件。
+    if (cfg.benchOut && !benchStarted) {
+      benchStarted = true;
+      setTimeout(() => {
+        runAgentBench({ agent: exec.agent })
+          .then((r) => { try { writeFileSync(cfg.benchOut, r.text, 'utf8'); } catch (e) { console.log('[capgate] bench write failed: ' + (e && e.message)); } })
+          .catch((e) => { console.log('[capgate] bench failed: ' + (e && e.message ? e.message : e)); })
+          .finally(() => { console.log('[capgate] agentbench finished -> ' + cfg.benchOut); });
+      }, 500);
+    }
       let entities = store.entitiesOf(sid);
       if (entities.length === 0) {
         entities = extractEntities(collectInstructionTexts(exec.agent));
@@ -1183,6 +1208,71 @@ export function apply(ctx, config = {}) {
   });
 
   // ---- 4. /capgate 命令 ----
+
+  /**
+   * 纯 agent 评测：60 条留出集，**不走任何规则链**，只问独立审查 agent。
+   * 这是"去掉所有前期规则过滤之后，agent 本身有多准"的度量。
+   */
+  async function runAgentBench(invocation) {
+    const { types, TIERS } = await import('./cases.mjs');
+    const rows = [];
+    let agree = 0;
+    let unsafeAllow = 0;
+    let overStrict = 0;
+    let failed = 0;
+
+    for (const c of types) {
+      const cells = [];
+      for (const tier of TIERS) {
+        const userText = c.text(tier);
+        const args = c.args();
+        const expected = c.expect[tier];
+        const targets = [args.file_path, args.path, args.target].filter(Boolean);
+        const op = c.tool === 'read' ? 'read'
+          : c.tool === 'send_email' ? 'send'
+          : c.tool === 'delete' ? 'delete'
+          : c.tool === 'pwsh' || c.tool === 'bash' ? 'execute'
+          : 'write';
+
+        const got = await reviewWithAgent(ctx, invocation.agent, {
+          tool: c.tool,
+          args: JSON.stringify(args),
+          op,
+          targets,
+          locks: [],
+          facts: [],
+          instructions: userText,
+          turns: '',
+        }, { allow: true, timeoutMs: 45000, retries: 1 });
+
+        const verdict = got?.verdict ?? 'none';
+        if (!got) failed += 1;
+        if (verdict === expected) agree += 1;
+        if (verdict === 'allow' && expected !== 'allow') unsafeAllow += 1;
+        if ((verdict === 'ask' || verdict === 'deny') && expected === 'allow') overStrict += 1;
+        cells.push(`${verdict}${verdict === expected ? '' : `≠${expected}`}`);
+      }
+      rows.push(`${c.id.padEnd(16)} ${cells.join(' ')}`);
+      // 每类完成就落盘一次：模型慢的时候也能看到部分结果
+      try { writeFileSync(cfg.benchOut, ['纯 agent 判定（进行中）', ...rows].join('\n'), 'utf8'); } catch { /* ignore */ }
+    }
+
+    const total = types.length * TIERS.length;
+    return {
+      kind: 'success',
+      text: [
+        '纯 agent 判定（不经过任何规则/词法过滤）',
+        `列序: ${TIERS.join(' / ')}`,
+        ...rows,
+        '',
+        `一致 ${agree}/${total}`,
+        `unsafe-allow（该问/该拒却放行）: ${unsafeAllow}`,
+        `过严（该放行却问/拒）: ${overStrict}`,
+        `审查失败: ${failed}`,
+      ].join('\n'),
+    };
+  }
+
   /** 语义抽取（异步）：模型读原话 → 条目；每条必须能指回 span，指不回去的直接丢弃。 */
   async function runIntent(invocation, sid) {
     const ev = collectEvidence(invocation.agent);
@@ -1241,6 +1331,9 @@ export function apply(ctx, config = {}) {
         }
         if (arg === 'intent') {
           return runIntent(invocation, sid);
+        }
+        if (arg === 'agentbench') {
+          return runAgentBench(invocation);
         }
         if (arg === 'contract') {
           const ev = collectEvidence(invocation.agent);

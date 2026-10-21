@@ -21,8 +21,8 @@ test('审查提示词：明确"只读、不能放行、引文才能解除锁"', 
   assert.match(p, /Authorization comes ONLY from the user instructions/);
 });
 
-test('工具面收窄到只读四个', () => {
-  assert.deepEqual(REVIEW_TOOLS.sort(), ['glob', 'grep', 'list', 'read'].sort());
+test('工具面收窄到只读三个（dsh 没有 list 工具）', () => {
+  assert.deepEqual([...REVIEW_TOOLS].sort(), ['glob', 'grep', 'read']);
   assert.ok(!REVIEW_TOOLS.includes('pwsh'));
   assert.ok(!REVIEW_TOOLS.includes('write'));
 });
