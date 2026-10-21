@@ -21,6 +21,7 @@ import { findReadContent, hashText } from './readlog.mjs';
 import { collectProvenance, allCreated, allRead } from './provenance.mjs';
 import { judgeCoverage } from './coverage.mjs';
 import { absoluteDanger, resolveEffect } from './effects.mjs';
+import { reviewWithAgent } from './reviewer.mjs';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { parseIntent, extractIntent, callModel } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
@@ -59,6 +60,7 @@ export const DEFAULTS = {
   provenanceMode: 'on',
   coverageMode: 'on',
   readGate: 'shadow',
+  reviewerMode: 'agent',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -95,6 +97,7 @@ export const Config = Schema.object({
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
   readGate: Schema.union(['off', 'shadow', 'on']).default('shadow').description('读闸门：shadow=只记录词法与语义是否一致；on=语义不同意就不放行'),
+  reviewerMode: Schema.union(['off', 'agent']).default('agent').description('审查由独立 subagent 承担（只读工具 + 结构化输出）；不可用时自动退回提示词审查'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -403,6 +406,34 @@ export function apply(ctx, config = {}) {
 
       const probe = verify({ op: klass.op, targets }, { scope: { mode: cfg.verifierScope, root: cwd ?? '' } });
       const facts = factList(probe);
+
+      // 优先让独立审查 agent 来判（它有自己的上下文和只读工具）；
+      // 不可用/失败时退回单次提示词审查。
+      if (cfg.reviewerMode !== 'off') {
+        const agentReview = await reviewWithAgent(ctx, exec.agent, {
+          tool: exec.name,
+          args: JSON.stringify(exec.arguments ?? {}),
+          op: klass.op,
+          targets,
+          locks: locksOf(klass, effect),
+          facts,
+          instructions,
+          turns,
+        }, { timeoutMs: Math.max(5000, cfg.judgeTimeoutMs) });
+        if (agentReview) {
+          const text = renderAsk({
+            action: agentReview.action || label,
+            facts: agentReview.facts,
+            suggestion: agentReview.suggestion,
+            alternatives: agentReview.alternatives,
+          });
+          audit({
+            event: 'ask_review', sid: sidOf(exec.agent), tool: exec.name, class: klass.key,
+            via: agentReview.via, verdict: agentReview.verdict, reason,
+          });
+          return { ...agentReview, text, alternatives: agentReview.alternatives };
+        }
+      }
 
       const text = await callModel(ctx, exec.agent, {
         system: 'You write one clear review question for a human. Output JSON only.',
