@@ -49,11 +49,11 @@ export function instructionOnly(text) {
 
 /**
  * 采集任务证据：原文 + 切分 + 人给的标签。
- * taskId 目前等于 session id —— 真正的任务边界应该由宿主给，这里先不做猜测。
+ * taskId 默认等于 session id；宿主能给真实任务边界时应覆盖它（config.taskId）。
  */
-export function collectEvidence(agent, { labels = [] } = {}) {
+export function collectEvidence(agent, { labels = [], taskId = '', window = 'latest' } = {}) {
   const sessionId = String(agent?.session?.id ?? 'anonymous');
-  const out = { taskId: sessionId, instructions: [], labels: [] };
+  const out = { taskId: taskId || sessionId, instructions: [], labels: [] };
   try {
     const session = agent?.session;
     if (!session) return out;
@@ -79,6 +79,11 @@ export function collectEvidence(agent, { labels = [] } = {}) {
     }
   } catch {
     // 会话面不可读 → 证据为空 → 后续一律转人工，绝不因此放行
+  }
+  // 任务边界：默认只看最后一条用户指令。
+  // 不加这条，上一个任务的授权会漏到下一个任务里（真机上已经发生过一次）。
+  if (window === 'latest' && out.instructions.length > 1) {
+    out.instructions = out.instructions.slice(-1);
   }
   out.labels = labels.slice(-200);
   return out;
@@ -135,6 +140,29 @@ export function effectiveEntries(entries = []) {
   for (const e of entries) latest.set(`${e.op}|${e.target}`, e);
   const keep = new Set([...latest.values()]);
   return entries.filter((e) => keep.has(e));
+}
+
+/** 契约条目是否覆盖这次调用（op 相同、目标被条目包含）。 */
+export function intentCovers(entries, { op, targets } = {}) {
+  const list = (entries ?? []).filter((e) => e.op === op);
+  if (list.length === 0) return undefined;
+  const norm = (s) => String(s).replace(/\\/g, '/').toLowerCase();
+  const covered = (t) => list.find((e) => {
+    const p = norm(e.target);
+    const v = norm(t);
+    if (!p) return false;
+    if (p === v) return true;
+    if (/[*?]/.test(p)) {
+      const re = new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
+      return re.test(v);
+    }
+    return v.startsWith(p.endsWith('/') ? p : `${p}/`);
+  });
+  const pathTargets = (targets ?? []).filter(Boolean);
+  if (pathTargets.length === 0) return undefined;
+  const hits = pathTargets.map(covered);
+  if (hits.some((h) => !h)) return undefined;   // 有一个目标没被覆盖就不算覆盖
+  return { entries: hits, span: hits[0]?.span };
 }
 
 /**

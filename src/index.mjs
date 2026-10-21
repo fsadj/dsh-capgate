@@ -13,7 +13,7 @@
 import Schema from '@deepseek-ai/schemastery';
 import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf, normalizePath, locksOf } from './classify.mjs';
 import { collectInstructionTexts, findCitation, citationSupports, isInterrogative, extractEntities } from './citations.mjs';
-import { collectEvidence, instructionOnly, locateSpan, renderContract, validateIntent, effectiveEntries } from './evidence.mjs';
+import { collectEvidence, instructionOnly, locateSpan, renderContract, validateIntent, effectiveEntries, intentCovers } from './evidence.mjs';
 import { minimizeOptions, describeMinimize } from './minimize.mjs';
 import { verify, summarizeFacts } from './verifier.mjs';
 import { parseIntent, extractIntent } from './intent.mjs';
@@ -43,6 +43,9 @@ export const DEFAULTS = {
   judgeAutoAllow: true,
   judgeTimeoutMs: 8000,
   verifyMode: 'on',
+  intentMode: 'on',
+  evidenceWindow: 'latest',
+  taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
   ruleDenyKeywords: [],
@@ -69,6 +72,9 @@ export const Config = Schema.object({
   judgeAutoAllow: Schema.boolean().default(true).description('允许复核放行（仅限项目内/非敏感/非批量/非出网/非不透明）'),
   judgeTimeoutMs: Schema.number().default(8000).description('复核超时；超时转人工'),
   verifyMode: Schema.union(['off', 'on']).default('on').description('独立核查：只读探针，只回事实'),
+  intentMode: Schema.union(['off', 'on']).default('on').description('语义引文：从原话抽取契约条目'),
+  evidenceWindow: Schema.union(['latest', 'session']).default('latest').description('授权证据窗口：只看最后一条指令（默认）或整个会话'),
+  taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
   ruleDenyKeywords: Schema.array(String).default([]),
@@ -184,7 +190,7 @@ export function apply(ctx, config = {}) {
 
   function evidenceFor(agent, klass, effect) {
     // 只从 instruction 片段里取授权：用户粘贴的日志/网页是数据，不是授权。
-    const evidence = collectEvidence(agent);
+    const evidence = collectEvidence(agent, { window: cfg.evidenceWindow });
     const texts = evidence.instructions
       .map((m) => ({ text: instructionOnly(m.text), seq: m.seq, msgId: m.msgId }))
       .filter((t) => t.text.length > 0);
@@ -248,6 +254,33 @@ export function apply(ctx, config = {}) {
   // 否则事后看日志会分不清"插件没拦"和"插件没在看"。
   const dormantSeen = new Set();
   const schemaSeen = new Set();
+
+  /** 语义引文缓存：用户指令没变就不重复抽取（一次任务只花一次模型调用）。 */
+  const intentCache = new Map();
+
+  async function ensureIntent(agent, sid) {
+    const ev = collectEvidence(agent, { taskId: cfg.taskId, window: cfg.evidenceWindow });
+    const corpus = ev.instructions.map((m) => instructionOnly(m.text)).filter(Boolean).join('\n');
+    if (!corpus.trim()) return [];
+    const hash = `${corpus.length}:${corpus.slice(0, 60)}:${corpus.slice(-60)}`;
+    const cached = intentCache.get(sid);
+    if (cached && cached.hash === hash) return cached.entries;
+
+    const parsed = await extractIntent(ctx, agent, corpus, { timeoutMs: Math.max(4000, cfg.judgeTimeoutMs * 2) });
+    if (!parsed) {
+      intentCache.set(sid, { hash, entries: [] });
+      return [];
+    }
+    const { accepted, rejected, residual } = validateIntent(ev, parsed);
+    const entries = residual ? [] : effectiveEntries(accepted);
+    intentCache.set(sid, { hash, entries });
+    audit({
+      event: 'intent', sid, accepted: entries.map((e) => `${e.op}:${e.target}`),
+      rejected: rejected.length, residual,
+    });
+    return entries;
+  }
+
   function noteDormant(agent, tool) {
     const sid = sidOf(agent);
     const reason = mode() !== 'capgate' ? 'mode=standard' : `preset!=${cfg.requiredPreset}`;
@@ -426,6 +459,34 @@ export function apply(ctx, config = {}) {
       return next();
     }
 
+    // 1.6b 语义引文：原文没逐字提到，但模型从原话里抽出的契约条目覆盖了这次调用。
+    //      只在"没有锁死类别"时生效——批量/出网/不透明/提权/未知仍然必须问人。
+    //      抽取失败的语义（residual / 无 span）一律不算授权（fail-closed）。
+    if (!evidence.ok && cfg.intentMode === 'on' && klass.op !== 'other') {
+      const locksNow = locksOf(klass, effect);
+      if (locksNow.length === 0 || (locksNow.length === 1 && locksNow[0] === 'unknown')) {
+        try {
+          const entries = await ensureIntent(exec.agent, sid);
+          const pathTargets = effect.targets.filter((t) => t.kind === 'path').map((t) => t.value);
+          const hit = intentCovers(entries, { op: klass.op, targets: pathTargets });
+          if (hit) {
+            console.log('[capgate] intent-grant ' + klass.key);
+            store.grant(sid, klass.key, { via: 'intent' });
+            store.bump(sid, 'grant');
+            store.bump(sid, 'citation');
+            audit({
+              event: 'grant', by: 'intent', sid, tool: exec.name, class: klass.key,
+              span: hit.span ? { msgId: hit.span.msgId, start: hit.span.start, end: hit.span.end } : undefined,
+              entries: hit.entries.map((e) => `${e.op}:${e.target}`),
+            });
+            return next();
+          }
+        } catch (err) {
+          audit({ event: 'intent_failed', sid, tool: exec.name, reason: String(err && err.message ? err.message : err) });
+        }
+      }
+    }
+
     // 1.7 项目外 + 无引文 = 确定性拒绝（在复核之前）。
     //     让 LLM 先跑会把这条确定性边界软化成"问人"，既不更安全也更吵。
     if (klass.scope !== 'workspace') {
@@ -588,7 +649,11 @@ export function apply(ctx, config = {}) {
     // 1.8b 独立核查：只在"看不懂/不透明/要外发"时做，只读、有预算、只回事实。
     //      verifier 可以直接拒绝（收紧自由），但**不能放行**——放行仍要过策略。
     let verifyNote = '';
-    if (cfg.verifyMode === 'on' && ['other', 'send', 'execute'].includes(klass.op)) {
+    const verifyWorthy = cfg.verifyMode === 'on' && (
+      ['other', 'send', 'execute'].includes(klass.op)
+      || (klass.op === 'read' && klass.scope !== 'workspace')
+    );
+    if (verifyWorthy) {
       try {
         const checked = verify({
           op: klass.op,
