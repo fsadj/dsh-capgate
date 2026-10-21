@@ -13,8 +13,10 @@
 import Schema from '@deepseek-ai/schemastery';
 import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf, normalizePath, locksOf } from './classify.mjs';
 import { collectInstructionTexts, findCitation, citationSupports, isInterrogative, extractEntities } from './citations.mjs';
-import { collectEvidence, instructionOnly, locateSpan, renderContract } from './evidence.mjs';
+import { collectEvidence, instructionOnly, locateSpan, renderContract, validateIntent, effectiveEntries } from './evidence.mjs';
 import { minimizeOptions, describeMinimize } from './minimize.mjs';
+import { verify, summarizeFacts } from './verifier.mjs';
+import { parseIntent, extractIntent } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
 import { loadState, saveState, observe, candidates, addRule, removeRule, hasRule } from './learn.mjs';
@@ -40,6 +42,7 @@ export const DEFAULTS = {
   judgeMode: 'residual',
   judgeAutoAllow: true,
   judgeTimeoutMs: 8000,
+  verifyMode: 'on',
   ruleAllowTools: [],
   ruleDenyTools: [],
   ruleDenyKeywords: [],
@@ -65,6 +68,7 @@ export const Config = Schema.object({
   judgeMode: Schema.union(['off', 'residual']).default('residual').description('残余 LLM 判定'),
   judgeAutoAllow: Schema.boolean().default(true).description('允许复核放行（仅限项目内/非敏感/非批量/非出网/非不透明）'),
   judgeTimeoutMs: Schema.number().default(8000).description('复核超时；超时转人工'),
+  verifyMode: Schema.union(['off', 'on']).default('on').description('独立核查：只读探针，只回事实'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
   ruleDenyKeywords: Schema.array(String).default([]),
@@ -359,7 +363,7 @@ export function apply(ctx, config = {}) {
     // 1.2b 完全相同的命令已被人工批准过 → 直接放行（不推广到"同类"，只认同一条）
     if (store.hasSignature(sid, signature)) {
       store.bump(sid, 'allow');
-      audit({ event: 'allow', by: 'identical', sid, tool: exec.name, class: klass.key });
+      store.bump(sid, 'reuse'); audit({ event: 'allow', by: 'identical', sid, tool: exec.name, class: klass.key });
       return next();
     }
 
@@ -369,7 +373,7 @@ export function apply(ctx, config = {}) {
       const pathTargets = effect.targets.filter((t) => t.kind === 'path').map((t) => t.value);
       if (store.coveredByExtent(sid, klass.op, pathTargets)) {
         store.bump(sid, 'allow');
-        audit({ event: 'allow', by: 'extent', sid, tool: exec.name, class: klass.key, targets: pathTargets.slice(0, 5) });
+        store.bump(sid, 'reuse'); audit({ event: 'allow', by: 'extent', sid, tool: exec.name, class: klass.key, targets: pathTargets.slice(0, 5) });
         return next();
       }
     }
@@ -384,21 +388,21 @@ export function apply(ctx, config = {}) {
     // 1.3 项目内普通读
     if (cfg.autoAllowReads && klass.op === 'read' && klass.scope === 'workspace') {
       store.bump(sid, 'allow');
-      audit({ event: 'allow', by: 'read-fast-path', sid, tool: exec.name, class: klass.key });
+      store.bump(sid, 'proof'); audit({ event: 'allow', by: 'read-fast-path', sid, tool: exec.name, class: klass.key });
       return next();
     }
 
     // 1.3b 项目外普通读
     if (cfg.autoAllowOutsideReads && klass.op === 'read') {
       store.bump(sid, 'allow');
-      audit({ event: 'allow', by: 'outside-read-fast-path', sid, tool: exec.name, class: klass.key });
+      store.bump(sid, 'proof'); audit({ event: 'allow', by: 'outside-read-fast-path', sid, tool: exec.name, class: klass.key });
       return next();
     }
 
     // 1.4 已授予的类
     if (store.isGranted(sid, klass.key)) {
       store.bump(sid, 'allow');
-      audit({ event: 'allow', by: 'class-grant', sid, tool: exec.name, class: klass.key });
+      store.bump(sid, 'reuse'); audit({ event: 'allow', by: 'class-grant', sid, tool: exec.name, class: klass.key });
       return next();
     }
 
@@ -418,7 +422,7 @@ export function apply(ctx, config = {}) {
     if (evidence.ok) {
       store.grant(sid, klass.key, { via: 'citation', citation: evidence.primary });
       store.bump(sid, 'grant');
-      audit({ event: 'grant', by: 'citation', sid, tool: exec.name, class: klass.key, cited: evidence.primary.text });
+      store.bump(sid, 'citation'); audit({ event: 'grant', by: 'citation', sid, tool: exec.name, class: klass.key, cited: evidence.primary.text });
       return next();
     }
 
@@ -553,7 +557,7 @@ export function apply(ctx, config = {}) {
       if (judgement.decision === 'allow' && judgeMayGrant) {
         store.grant(sid, klass.key, { via: 'judge' });
         store.bump(sid, 'grant');
-        audit({ event: 'grant', by: 'judge', sid, tool: exec.name, class: klass.key, reason: judgement.reason });
+        store.bump(sid, 'judge'); audit({ event: 'grant', by: 'judge', sid, tool: exec.name, class: klass.key, reason: judgement.reason });
         return next();
       }
 
@@ -581,12 +585,52 @@ export function apply(ctx, config = {}) {
     }
 
     // 1.9 项目内但没引文
+    // 1.8b 独立核查：只在"看不懂/不透明/要外发"时做，只读、有预算、只回事实。
+    //      verifier 可以直接拒绝（收紧自由），但**不能放行**——放行仍要过策略。
+    let verifyNote = '';
+    if (cfg.verifyMode === 'on' && ['other', 'send', 'execute'].includes(klass.op)) {
+      try {
+        const checked = verify({
+          op: klass.op,
+          targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
+        });
+        if (checked.facts.length > 0) {
+          const summary = summarizeFacts(checked);
+          verifyNote = summary;
+          audit({ event: 'verify', sid, tool: exec.name, class: klass.key, probes: checked.probes, facts: summary });
+        }
+        if (checked.recommendation === 'deny') {
+          const opts = minimizeOptions({
+            op: klass.op,
+            targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
+          });
+          store.bump(sid, 'deny');
+          audit({ event: 'deny', by: 'verifier', sid, tool: exec.name, class: klass.key, reason: checked.reason });
+          return {
+            kind: 'deny',
+            reason: `capgate: ${checked.reason}。${checked.facts.length ? `（${summary}）\n` : '\n'}${describeMinimize(opts)}`,
+            alternatives: opts.map((o) => o.label),
+          };
+        }
+      } catch (err) {
+        audit({ event: 'verify_failed', sid, tool: exec.name, reason: String(err && err.message ? err.message : err) });
+      }
+    }
+
+    // 1.9 项目内但没引文
     store.rememberPending(sid, exec.callId, {
       key: klass.key, label, autoEligible: false, op: klass.op, opaque: !!effect.opaque,
     });
     store.bump(sid, 'ask');
     audit({ event: 'ask', sid, tool: exec.name, class: klass.key, autoEligible: false, why: evidence.why });
-    return guardAsk(exec.agent, askDecision(`capgate: 首次使用「${label}」，未找到用户原话依据（${evidence.why}）`, label), label);
+    return guardAsk(
+      exec.agent,
+      askDecision(
+        `capgate: 首次使用「${label}」，未找到用户原话依据（${evidence.why}）${verifyNote ? `；核查：${verifyNote}` : ''}`,
+        label,
+      ),
+      label,
+    );
   }, { prepend: true });
 
   // ---- 2. 审批裁决 ----
@@ -734,6 +778,29 @@ export function apply(ctx, config = {}) {
   });
 
   // ---- 4. /capgate 命令 ----
+  /** 语义抽取（异步）：模型读原话 → 条目；每条必须能指回 span，指不回去的直接丢弃。 */
+  async function runIntent(invocation, sid) {
+    const ev = collectEvidence(invocation.agent);
+    const corpus = ev.instructions.map((m) => instructionOnly(m.text)).filter(Boolean).join('\n');
+    if (!corpus.trim()) return { kind: 'error', text: 'capgate: 本会话没有用户指令，无法抽取意图' };
+
+    const parsed = await extractIntent(ctx, invocation.agent, corpus, { timeoutMs: cfg.judgeTimeoutMs * 2 });
+    if (!parsed) return { kind: 'error', text: 'capgate: 意图抽取失败（模型不可用或输出不合规），按"无授权"处理' };
+
+    const { accepted, rejected, residual } = validateIntent(ev, parsed);
+    ev.labels = [...store.session(sid).grants.keys()].slice(-10).map((k) => ({
+      verdict: 'allow', op: String(k).split('|')[0], target: k,
+    }));
+    const md = renderContract(ev, effectiveEntries(accepted));
+    const tail = [
+      '',
+      `抽取结果: 采纳 ${accepted.length} 条，丢弃 ${rejected.length} 条（无 span）${residual ? '，residual=true' : ''}`,
+      ...rejected.map((r) => `  ✗ 丢弃：${r.op} ${r.target}（quote 不在原文里）`),
+    ].join('\n');
+    audit({ event: 'intent', sid, accepted: accepted.map((e) => `${e.op}:${e.target}`), rejected: rejected.length, residual });
+    return { kind: 'success', text: md + tail };
+  }
+
   // apply 执行时 commands 服务通常还没挂好，ctx.get('commands') 会是 undefined；
   // 用可选注入等它出现，否则 /capgate 永远不会被注册。
   const registerCommand = (commands) => {
@@ -765,6 +832,9 @@ export function apply(ctx, config = {}) {
             `denyPaths: ${rules.denyPaths.join(', ') || '(none)'}`,
           ];
           return { kind: 'success', text: `capgate 规则\n${lines.join('\n')}` };
+        }
+        if (arg === 'intent') {
+          return runIntent(invocation, sid);
         }
         if (arg === 'contract') {
           const ev = collectEvidence(invocation.agent);
@@ -801,11 +871,18 @@ export function apply(ctx, config = {}) {
         const grants = [...s.grants.keys()];
         let preset;
         try { preset = ctx.get?.('permissionPresets')?.current?.(invocation.agent?.session); } catch { preset = undefined; }
+        // 成本账：LLM 调用 vs 被"无风险短路"省掉的次数
+        const shorted = (stats.proof ?? 0) + (stats.citation ?? 0) + (stats.reuse ?? 0) + (stats.rule ?? 0);
+        const judged = stats.judge ?? 0;
+        const total = shorted + judged;
+        const saved = total > 0 ? Math.round((shorted / total) * 100) : 0;
         const body = [
           `mode=${mode()} preset=${preset ?? '(unknown)'}${cfg.requiredPreset ? `(需要 ${cfg.requiredPreset})` : ''}`
             + ` active=${active(invocation.agent) ? 'yes' : 'NO — 本档不接管'}`,
-          `judge=${cfg.judgeMode}${cfg.judgeAutoAllow ? '(auto-allow)' : ''}`,
-          `counters: allow=${stats.allow} ask=${stats.ask} deny=${stats.deny} grant=${stats.grant} judge=${stats.judge}`,
+          `judge=${cfg.judgeMode}${cfg.judgeAutoAllow ? '(auto-allow)' : ''} verify=${cfg.verifyMode}`,
+          `counters: allow=${stats.allow} ask=${stats.ask} deny=${stats.deny} grant=${stats.grant} judge=${judged}`,
+          `短路来源: 证明式只读=${stats.proof ?? 0} 引文=${stats.citation ?? 0} 复用(类/范围/同命令)=${stats.reuse ?? 0} 规则=${stats.rule ?? 0}`,
+          `LLM 节省率: ${saved}%（${shorted}/${total}，未省 ${judged} 次）`,
           `granted classes (${grants.length}):`,
           ...(grants.length ? grants.map((k) => `  - ${k}`) : ['  (none)']),
         ];

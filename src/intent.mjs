@@ -67,6 +67,68 @@ export function parseCompiled(text) {
 
 /** 调当前会话模型编译一次；任何异常都返回 undefined（调用方按"编译失败"处理）。 */
 export async function compileEffects(ctx, agent, call, { timeoutMs = 8000 } = {}) {
+  const text = await callModel(ctx, agent, {
+    system: 'You compile shell commands into literal effects. Output JSON only.',
+    prompt: buildCompilePrompt(call),
+    timeoutMs,
+  });
+  return text === undefined ? undefined : parseCompiled(text);
+}
+
+/* ───────────────────────── 意图抽取（语义，不是正则） ───────────────────────── */
+
+export function buildIntentPrompt(instructions) {
+  return [
+    'You read a user\'s instructions and write down the MINIMUM data access they authorize.',
+    'Return ONLY JSON: {"entries":[{"op":"read|write|delete|send|execute","target":"<literal path or host>","quote":"<exact substring copied from the instructions>"}],"residual":false}',
+    '',
+    'Rules:',
+    '- quote MUST be an exact substring of the instructions below. Do not paraphrase.',
+    '- Write the MINIMUM scope the task needs, not the maximum the user might mean.',
+    '- Keep hedges exact: "先看看" is read, "删了也行" is not a directive, "除了一季度" is an exclusion.',
+    '- If the user did not authorize any concrete data access, return {"entries":[],"residual":true}.',
+    '- residual=true when the instruction is too vague to derive literal targets.',
+    '',
+    'INSTRUCTIONS:',
+    instructions,
+  ].join('\n');
+}
+
+/** 解析意图抽取结果（严格：任何一条没有 quote 就丢弃）。 */
+export function parseIntent(text) {
+  const raw = String(text ?? '');
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start < 0 || end <= start) return undefined;
+  let obj;
+  try { obj = JSON.parse(raw.slice(start, end + 1)); } catch { return undefined; }
+  if (!obj || typeof obj !== 'object' || !Array.isArray(obj.entries)) return undefined;
+
+  const entries = [];
+  for (const e of obj.entries.slice(0, 32)) {
+    const op = String(e?.op ?? '').toLowerCase();
+    const target = typeof e?.target === 'string' ? e.target.trim() : '';
+    const quote = typeof e?.quote === 'string' ? e.quote.trim() : '';
+    if (!['read', 'write', 'delete', 'send', 'execute'].includes(op)) continue;
+    if (!quote) continue;                 // 没有原文依据 → 直接丢
+    entries.push({ op, target, quote });
+  }
+  return { entries, residual: obj.residual === true };
+}
+
+/** 调模型抽一次意图。 */
+export async function extractIntent(ctx, agent, instructions, { timeoutMs = 12000 } = {}) {
+  if (!String(instructions ?? '').trim()) return undefined;
+  const text = await callModel(ctx, agent, {
+    system: 'You extract the minimum authorized data access from instructions. Output JSON only.',
+    prompt: buildIntentPrompt(instructions),
+    timeoutMs,
+  });
+  return text === undefined ? undefined : parseIntent(text);
+}
+
+/** 统一的模型调用（provider/model 取当前会话路由）。 */
+async function callModel(ctx, agent, { system, prompt, timeoutMs = 8000 }) {
   const llm = (() => { try { return ctx.get?.('llm'); } catch { return undefined; } })();
   if (!llm || typeof llm.stream !== 'function') return undefined;
 
@@ -83,8 +145,8 @@ export async function compileEffects(ctx, agent, call, { timeoutMs = 8000 } = {}
     const stream = llm.stream({
       provider,
       model,
-      system: 'You compile shell commands into literal effects. Output JSON only.',
-      messages: [{ role: 'user', content: [{ type: 'text', text: buildCompilePrompt(call) }] }],
+      system,
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
       temperature: 0,
       signal: controller.signal,
     });
@@ -93,12 +155,13 @@ export async function compileEffects(ctx, agent, call, { timeoutMs = 8000 } = {}
       if (chunk?.type === 'finish') break;
     }
   } catch (err) {
-    console.warn('[capgate] compile failed:', err && err.message ? err.message : err);
+    console.warn('[capgate] model call failed:', err && err.message ? err.message : err);
     return undefined;
   } finally {
     clearTimeout(timer);
   }
-  return parseCompiled(text);
+  return text;
 }
+
 
 export { PREFIX };

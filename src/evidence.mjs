@@ -115,6 +115,29 @@ export function locateSpan(evidence, needle) {
 }
 
 /**
+ * 校验模型抽出的意图：每一条都必须能指回原文 span，指不回去的直接丢弃。
+ * 这是"语义交给模型、保真交给机器"的落点。
+ */
+export function validateIntent(evidence, parsed) {
+  const accepted = [];
+  const rejected = [];
+  for (const e of parsed?.entries ?? []) {
+    const span = locateSpan(evidence, e.quote);
+    if (span) accepted.push({ ...e, span, source: 'user' });
+    else rejected.push(e);
+  }
+  return { accepted, rejected, residual: parsed?.residual === true };
+}
+
+/** 后出现的条目覆盖先出现的同 (op,target) 条目（显式 supersession）。 */
+export function effectiveEntries(entries = []) {
+  const latest = new Map();
+  for (const e of entries) latest.set(`${e.op}|${e.target}`, e);
+  const keep = new Set([...latest.values()]);
+  return entries.filter((e) => keep.has(e));
+}
+
+/**
  * 渲染"契约视图"——注意它是**投影**，不是状态：随时可以丢弃重建。
  * 每条都必须能指回 span；指不回去的标成 inferred（只可收紧）。
  */

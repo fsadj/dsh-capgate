@@ -1,6 +1,6 @@
-import { test } from 'node:test';
+﻿import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { splitSegments, instructionOnly, collectEvidence, locateSpan, renderContract, instructionCorpus } from '../src/evidence.mjs';
+import { splitSegments, instructionOnly, collectEvidence, locateSpan, renderContract, instructionCorpus, validateIntent, effectiveEntries } from '../src/evidence.mjs';
 
 function agentWith(messages) {
   const events = messages.map((text, i) => ({
@@ -60,4 +60,30 @@ test('空会话不产生证据（后续一律转人工）', () => {
   assert.deepEqual(ev.instructions, []);
   assert.equal(instructionCorpus(ev), '');
   assert.equal(locateSpan(ev, 'x'), undefined);
+});
+
+test('意图校验：没有 span 的条目直接丢弃', () => {
+  const ev = collectEvidence(agentWith(['把下载目录里的 zip 清掉']));
+  const { accepted, rejected } = validateIntent(ev, {
+    entries: [
+      { op: 'delete', target: 'C:/Users/me/Downloads/*.zip', quote: '下载目录里的 zip' },
+      { op: 'delete', target: 'C:/', quote: '整个磁盘都删掉' },
+    ],
+    residual: false,
+  });
+  assert.equal(accepted.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.ok(accepted[0].span.start >= 0, '采纳的条目必须带 span 偏移');
+});
+
+test('同 (op,target) 后来者覆盖先前者', () => {
+  const entries = [
+    { op: 'delete', target: 'a.zip', seq: 1 },
+    { op: 'delete', target: 'a.zip', seq: 2 },
+    { op: 'read', target: 'a.zip', seq: 3 },
+  ];
+  const eff = effectiveEntries(entries);
+  assert.equal(eff.length, 2);
+  assert.equal(eff[0].seq, 2, 'delete/a.zip 取最后一条');
+  assert.equal(eff[1].op, 'read');
 });
