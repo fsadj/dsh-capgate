@@ -1,4 +1,4 @@
-/**
+﻿/**
  * capgate —— 效果类摊销授权（effect-class amortized authorization）。
  *
  * 判定链：
@@ -11,12 +11,13 @@
  *   3. 出网与不透明执行（脚本/解释器）不能由模型复核放行。
  */
 import Schema from '@deepseek-ai/schemastery';
-import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf } from './classify.mjs';
+import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf, normalizePath } from './classify.mjs';
 import { collectInstructionTexts, findCitation, citationSupports, isInterrogative, extractEntities } from './citations.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
 import { loadState, saveState, observe, candidates, addRule, removeRule, hasRule } from './learn.mjs';
 import { judgeResidual } from './judge.mjs';
+import { compileEffects } from './intent.mjs';
 
 export const name = 'capgate';
 
@@ -254,7 +255,7 @@ export function apply(ctx, config = {}) {
     const sid = sidOf(exec.agent);
     const classified = classOfCall(exec.agent, exec.name, exec.arguments);
     if (!classified) return guardAsk(exec.agent, askDecision('capgate: 无法解析本次调用的效果', '无法解析效果'), '无法解析效果');
-    const { effect, klass } = classified;
+    const { effect, klass, cwd } = classified;
     const label = describeClass(klass);
 
     // 完全相同的调用只问一次：签名 = tool + 稳定序列化的参数
@@ -401,6 +402,65 @@ export function apply(ctx, config = {}) {
         return guardAsk(exec.agent, askDecision(`capgate: ${label} 已反复被拒（${Math.max(n, repeats)} 次），转人工核对`, label), label);
       }
       return { kind: 'deny', reason: 'capgate: 拒绝（目标在项目外，且用户原话没有提到它）。义务: 改在项目内完成，或请用户明确指定该目标' };
+    }
+
+    // 1.7b "看不懂的调用"交给效果编译器：模型只负责**翻译**成字面效果，
+    //      放行/询问/拒绝仍由下面的确定性规则决定。
+    if (klass.op === 'other' && cfg.judgeMode === 'residual') {
+      const compiled = await compileEffects(
+        ctx,
+        exec.agent,
+        { tool: exec.name, args: exec.arguments },
+        { timeoutMs: cfg.judgeTimeoutMs },
+      );
+      if (compiled) {
+        const asEffect = (op, targets) => ({
+          op,
+          targets: targets.map((t) => (/^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(t) || /^https?:\/\//i.test(t)
+            ? { kind: 'host', value: t.replace(/^https?:\/\//i, '').split('/')[0].toLowerCase() }
+            : { kind: 'path', value: normalizePath(t, cwd) })),
+          wildcard: false,
+          opaque: false,
+          source: 'compiled',
+          raw: 'compiled',
+        });
+
+        const mutation = compiled.ops.find((o) => o.op === 'delete' || o.op === 'send');
+        if (mutation) {
+          const eff = asEffect(mutation.op, mutation.targets);
+          const k = classify(eff, { root: cwd });
+          store.bump(sid, 'deny');
+          audit({ event: 'deny', by: 'compiled', sid, tool: exec.name, class: k.key, targets: mutation.targets.slice(0, 5) });
+          return {
+            kind: 'deny',
+            reason: `capgate: 编译结果是「${mutation.op}」${mutation.targets.length ? '：' + mutation.targets.slice(0, 3).join(', ') : ''}`
+              + '；变更类操作不允许从"看不懂的调用"直接放行，请改用能说明目标的写法',
+          };
+        }
+
+        const allRead = compiled.ops.every((o) => o.op === 'read');
+        const allInside = compiled.ops.every((o) =>
+          asEffect(o.op, o.targets).targets.every((t) => classify(asEffect(o.op, o.targets), { root: cwd }).scope === 'workspace'));
+        if (allRead && allInside && !compiled.residual && cfg.judgeAutoAllow) {
+          store.bump(sid, 'allow');
+          audit({ event: 'allow', by: 'compiled-read', sid, tool: exec.name, class: klass.key });
+          return next();
+        }
+
+        // 编译出"项目内写/执行"或无法完全解析 → 问人，但把编译结果放进卡片
+        const summary = compiled.ops.map((o) => `${o.op}(${o.targets.slice(0, 2).join(',') || '?'})`).join(' / ');
+        const eff = asEffect(compiled.ops[0].op, compiled.ops[0].targets);
+        store.rememberPending(sid, exec.callId, {
+          key: classify(eff, { root: cwd }).key, label, autoEligible: false, op: 'other', opaque: false,
+        });
+        store.bump(sid, 'ask');
+        audit({ event: 'ask', sid, tool: exec.name, class: klass.key, compiled: summary, residual: compiled.residual });
+        return guardAsk(
+          exec.agent,
+          askDecision(`capgate: 看不懂这条调用，编译器认为它是「${summary}」${compiled.residual ? '（含无法解析的部分）' : ''}`, label),
+          label,
+        );
+      }
     }
 
     // 1.8 残余 LLM 判定（只处理"项目内、无引文"这一档）
