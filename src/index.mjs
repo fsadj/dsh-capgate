@@ -20,6 +20,7 @@ import { inspectScript } from './scriptaudit.mjs';
 import { findReadContent, hashText } from './readlog.mjs';
 import { collectProvenance, allCreated, allRead } from './provenance.mjs';
 import { judgeCoverage } from './coverage.mjs';
+import { absoluteDanger, resolveEffect } from './effects.mjs';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { parseIntent, extractIntent, callModel } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
@@ -57,6 +58,7 @@ export const DEFAULTS = {
   verifierAsk: 'on',
   provenanceMode: 'on',
   coverageMode: 'on',
+  readGate: 'shadow',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -92,6 +94,7 @@ export const Config = Schema.object({
   verifierAsk: Schema.union(['off', 'on']).default('on').description('询问时由独立 verifier 生成四段式问题（只能收紧）'),
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
+  readGate: Schema.union(['off', 'shadow', 'on']).default('shadow').description('读闸门：shadow=只记录词法与语义是否一致；on=语义不同意就不放行'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -302,6 +305,38 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * 读闸门：词法说"这是读"时，放行前问一次语义。
+   * 三种模式：
+   *   off    — 维持旧行为（不放语义调用）
+   *   shadow — 照旧放行，但记录词法与语义是否一致（用来量词法的错误率）
+   *   on     — 语义必须同意"读"，否则不放行（fail-closed）
+   */
+  async function readGate(exec, klass, sid) {
+    if (cfg.readGate === 'off') return 'ok';
+    let sem;
+    try {
+      sem = await resolveEffect(ctx, exec.agent, {
+        tool: exec.name, args: exec.arguments, timeoutMs: cfg.judgeTimeoutMs,
+      });
+    } catch {
+      sem = undefined;
+    }
+    const agree = sem ? sem.op === 'read' : undefined;
+    audit({
+      event: 'read_gate', sid, tool: exec.name, class: klass.key,
+      mode: cfg.readGate, lex: 'read', sem: sem?.op, source: sem?.source, agree,
+    });
+    if (!sem) return cfg.readGate === 'on' ? 'blocked' : 'ok';   // on 拿不到语义 → 不放行
+    if (sem.op === 'read') return 'ok';
+    if (cfg.readGate === 'shadow') {
+      console.log(`[capgate] read-gate-disagree lex=read sem=${sem.op}`);
+      return 'ok';
+    }
+    console.log(`[capgate] read-gate-blocked lex=read sem=${sem.op}`);
+    return 'blocked';
+  }
+
+  /**
    * 语义解除：把"锁"交给判断方，让它带引文说明"用户确实说了这个范围"。
    *
    * 只对**意图类**锁有效（批量/出网/不透明/提权）——这些缺的是"用户想不想"。
@@ -427,6 +462,25 @@ export function apply(ctx, config = {}) {
     }
 
     const sid = sidOf(exec.agent);
+
+    // 0. 绝对危险：词法层唯一保留的否决权。
+    //    命中即拒绝，不进入后续任何"可以商量"的路径；规则 id 进审计，可解释。
+    {
+      const rawText = typeof exec.arguments?.command === 'string' ? exec.arguments.command
+        : typeof exec.arguments?.cmd === 'string' ? exec.arguments.cmd
+        : typeof exec.arguments?.script === 'string' ? exec.arguments.script
+        : JSON.stringify(exec.arguments ?? {});
+      const danger = absoluteDanger(rawText);
+      if (danger) {
+        audit({ event: 'deny', by: 'absolute-danger', rule: danger.rule, sid, tool: exec.name });
+        store.bump(sid, 'deny');
+        return {
+          kind: 'deny',
+          reason: `capgate: 绝对危险操作，已拒绝（${danger.why}）。规则：${danger.rule}`,
+        };
+      }
+    }
+
     const classified = classOfCall(exec.agent, exec.name, exec.arguments);
     if (!classified) return guardAsk(exec.agent, askDecision('capgate: 无法解析本次调用的效果', '无法解析效果'), '无法解析效果');
     const { effect, klass, cwd } = classified;
@@ -545,18 +599,26 @@ export function apply(ctx, config = {}) {
       return next();
     }
 
-    // 1.3 项目内普通读
+    // 1.3 项目内普通读：词法说"读"，但放行前要过语义闸门。
+    //     readGate=shadow：只记录词法与语义是否一致（不改行为，用来量错误率）
+    //     readGate=on    ：语义必须也说"读"，否则不放行（fail-closed）
     if (cfg.autoAllowReads && klass.op === 'read' && klass.scope === 'workspace') {
-      store.bump(sid, 'allow');
-      store.bump(sid, 'proof'); audit({ event: 'allow', by: 'read-fast-path', sid, tool: exec.name, class: klass.key });
-      return next();
+      const gate = await readGate(exec, klass, sid);
+      if (gate === 'ok') {
+        store.bump(sid, 'allow');
+        store.bump(sid, 'proof'); audit({ event: 'allow', by: 'read-fast-path', sid, tool: exec.name, class: klass.key });
+        return next();
+      }
     }
 
-    // 1.3b 项目外普通读
+    // 1.3b 项目外普通读（同样要过读闸门；形状缓存让第二次判断不再花调用）
     if (cfg.autoAllowOutsideReads && klass.op === 'read') {
-      store.bump(sid, 'allow');
-      store.bump(sid, 'proof'); audit({ event: 'allow', by: 'outside-read-fast-path', sid, tool: exec.name, class: klass.key });
-      return next();
+      const gate = await readGate(exec, klass, sid);
+      if (gate === 'ok') {
+        store.bump(sid, 'allow');
+        store.bump(sid, 'proof'); audit({ event: 'allow', by: 'outside-read-fast-path', sid, tool: exec.name, class: klass.key });
+        return next();
+      }
     }
 
     // 1.4 已授予的类
