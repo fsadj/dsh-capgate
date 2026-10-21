@@ -19,6 +19,7 @@ import { verify, summarizeFacts, buildAskPrompt, parseAsk, renderAsk, factList }
 import { inspectScript } from './scriptaudit.mjs';
 import { findReadContent, hashText } from './readlog.mjs';
 import { collectProvenance, allCreated, allRead } from './provenance.mjs';
+import { judgeCoverage } from './coverage.mjs';
 import { existsSync, statSync, readFileSync } from 'node:fs';
 import { parseIntent, extractIntent, callModel } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
@@ -55,6 +56,7 @@ export const DEFAULTS = {
   scriptAudit: 'on',
   verifierAsk: 'on',
   provenanceMode: 'on',
+  coverageMode: 'on',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -89,6 +91,7 @@ export const Config = Schema.object({
   scriptAudit: Schema.union(['off', 'on']).default('on').description('脚本可读化：静态检查无危险 API 的脚本可按引文放行'),
   verifierAsk: Schema.union(['off', 'on']).default('on').description('询问时由独立 verifier 生成四段式问题（只能收紧）'),
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
+  coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -607,10 +610,34 @@ export function apply(ctx, config = {}) {
           const cmpTargets = effect.targets
             .filter((t) => t.kind === 'path' || t.kind === 'db')
             .map((t) => t.value);
-          const hit = intentCovers(entries, { op: klass.op, targets: cmpTargets });
+
+          // 快路：字面命中（便宜、确定）。没命中才让模型做指代消解。
+          let hit = intentCovers(entries, { op: klass.op, targets: cmpTargets });
+          let by = 'intent';
+          if (!hit && cfg.coverageMode === 'on' && cmpTargets.length > 0) {
+            const judged = await judgeCoverage(ctx, exec.agent, {
+              op: klass.op,
+              targets: cmpTargets,
+              entries,
+              instructions: instructionOnly(evidence.primary?.text ?? '') || undefined,
+              timeoutMs: cfg.judgeTimeoutMs,
+            });
+            if (judged) {
+              audit({
+                event: 'coverage', sid, tool: exec.name, class: klass.key,
+                covered: judged.covered.map((c) => `${c.target}#${c.entry}`),
+                uncovered: judged.uncovered, all: judged.allCovered,
+              });
+            }
+            if (judged?.allCovered) {
+              const cited = judged.covered.map((c) => entries[c.entry]).filter(Boolean);
+              hit = { entries: cited, span: cited[0]?.span };
+              by = 'coverage';
+            }
+          }
           if (hit) {
-            console.log('[capgate] intent-grant ' + klass.key);
-            store.grant(sid, klass.key, { via: 'intent' });
+            console.log(`[capgate] ${by}-grant ${klass.key}`);
+            store.grant(sid, klass.key, { via: by });
             store.bump(sid, 'grant');
             store.bump(sid, 'citation');
             audit({
