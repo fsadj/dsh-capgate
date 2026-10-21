@@ -1,4 +1,4 @@
-/**
+﻿/**
  * capgate —— 效果类摊销授权（effect-class amortized authorization）。
  *
  * 判定链：
@@ -78,6 +78,9 @@ function readMode(value) {
   if (value && typeof value === 'object' && typeof value.get === 'function') return value.get();
   return value;
 }
+
+/** shell 工具集合：效果在命令文本里，不按 schema 判。 */
+const SHELL_TOOLS = new Set(['pwsh', 'powershell', 'bash', 'sh', 'shell', 'cmd', 'run_command']);
 
 /** 命令文本里出现任何"变更/外发"迹象（编译结果的独立第二意见）。 */
 const MUTATION_HINT = /(remove-item|\brm\b|\bdel\b|erase\b|rmdir|\brd\b|set-content|add-content|out-file|new-item|move-item|copy-item|\bmv\b|\bcp\b|robocopy|curl|wget|invoke-restmethod|invoke-webrequest|scp|sftp|upload|\bpost\b|\bput\b)/i;
@@ -159,7 +162,6 @@ export function apply(ctx, config = {}) {
       // 推不出来再回退到按参数名/命令文本的启发式。
       // **shell 工具例外**：它的效果在 command 文本里，schema 只能说"有个 command 参数"，
       // 拿 schema 判 pwsh 会把 `Remove-Item` 误判成读——这是真机验证时抓到的。
-      const SHELL_TOOLS = new Set(['pwsh', 'powershell', 'bash', 'sh', 'shell', 'cmd', 'run_command']);
       const def = SHELL_TOOLS.has(callName) ? undefined : toolDefinition(callName, agent);
       const fromSchema = def ? effectOfSchema(def, args, cwd) : undefined;
       const effect = fromSchema ?? effectOf(callName, args, cwd);
@@ -512,14 +514,23 @@ export function apply(ctx, config = {}) {
       // LLM 复核只能"减问"，不能"放权"：
       // 只允许它在**低风险层**（项目内、非敏感、非批量、非出网、非不透明）直接放行；
       // 删除/出网/批量/越界/脚本一律只能 deny 或 ask，绝不由模型替人签字。
+      //
+      // 例外（压 ask）：shell 里的"未知命令"，如果复核说 allow **且**命令文本里
+      // 没有任何变更迹象，就按纯读处理。两路独立意见都无害才放行。
+      const shellUnknownButClean = SHELL_TOOLS.has(exec.name)
+        && klass.op === 'other'
+        && !MUTATION_HINT.test(String(effect.raw ?? ''));
+
       const judgeMayGrant = cfg.judgeAutoAllow
         && klass.op !== 'send'
-        && klass.op !== 'other'
         && !effect.opaque
-        && (process.env.CAPGATE_NO_TIER === '1' || (
-          klass.scope === 'workspace'
-          && klass.sensitivity !== 'sensitive'
-          && cardinalityOf(effect) !== 'many'
+        && (shellUnknownButClean || (
+          klass.op !== 'other'
+          && (process.env.CAPGATE_NO_TIER === '1' || (
+            klass.scope === 'workspace'
+            && klass.sensitivity !== 'sensitive'
+            && cardinalityOf(effect) !== 'many'
+          ))
         ));
       if (judgement.decision === 'allow' && judgeMayGrant) {
         store.grant(sid, klass.key, { via: 'judge' });
