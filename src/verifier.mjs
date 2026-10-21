@@ -177,3 +177,100 @@ export function summarizeFacts(result, limit = 4) {
 }
 
 export { redactLine };
+
+/* ─────────────────── 会提问的调查员（四元组问题） ─────────────────── */
+
+/**
+ * 目的：把"capgate: 首次使用「X」，未找到用户原话依据"这种卡片，
+ * 换成「动作 / 事实 / 建议 / 可替代」四段式。
+ *
+ * 模型只负责**把已掌握的信息组织成一个人能一眼回答的问题**，
+ * 它可以再要最多 3 个探针（只能指向本次调用的目标），但不能放行。
+ */
+export function buildAskPrompt(input) {
+  const lines = [
+    'You are the independent reviewer of a tool call. Write a question a human can answer in one look.',
+    'Return ONLY JSON:',
+    '{"probes":[{"kind":"stat|list|scan|sample","target":"<one of the targets>"}],'
+      + '"verdict":"ask|deny","action":"<what is about to happen, <=40 chars>",'
+      + '"facts":["<observed fact, <=40 chars>"],"suggestion":"<your recommendation, <=40 chars>",'
+      + '"alternatives":["<a strictly narrower thing the agent could do instead, <=40 chars>"]}',
+    '',
+    'Rules:',
+    '- Use ONLY the facts provided. Do not invent paths, sizes or contents.',
+    '- probes: at most 3, target MUST be one of the targets listed below. Omit if you need nothing more.',
+    '- verdict=deny ONLY if the facts show a concrete violation (sensitive data leaving, destructive scope).',
+    '- alternatives must be strictly narrower: same target, less data/less effect.',
+    '- Answer in Chinese. No prose outside the JSON.',
+    '',
+    'TOOL: ' + input.tool,
+    'EFFECT: ' + input.op + ' -> ' + input.targets.join(', '),
+    'LOCKS: ' + (input.locks.length ? input.locks.join(', ') : '(none)'),
+    'PROBED FACTS:',
+    ...(input.facts.length ? input.facts.map((f) => '- ' + f) : ['- (none)']),
+    '',
+    'USER INSTRUCTIONS (most recent):',
+    input.instructions || '(none)',
+    '',
+    'RECENT CONTEXT:',
+    input.turns || '(none)',
+    '',
+    'CALL:',
+    String(input.args ?? '').slice(0, 1200),
+  ];
+  return lines.join('\n');
+}
+
+export function parseAsk(text) {
+  const raw = String(text ?? '');
+  const start = raw.indexOf('{');
+  const end = raw.lastIndexOf('}');
+  if (start < 0 || end <= start) return undefined;
+  let obj;
+  try { obj = JSON.parse(raw.slice(start, end + 1)); } catch { return undefined; }
+  if (!obj || typeof obj !== 'object') return undefined;
+
+  const str = (v, n = 60) => (typeof v === 'string' ? v.trim().slice(0, n) : '');
+  const list = (v, n = 3) => (Array.isArray(v) ? v.map((x) => str(x, 60)).filter(Boolean).slice(0, n) : []);
+
+  const probes = Array.isArray(obj.probes)
+    ? obj.probes
+      .filter((p) => p && typeof p.kind === 'string' && ['stat', 'list', 'scan', 'sample'].includes(p.kind))
+      .map((p) => ({ kind: p.kind, target: str(p.target, 260) }))
+      .filter((p) => p.target)
+      .slice(0, 3)
+    : [];
+
+  return {
+    probes,
+    verdict: obj.verdict === 'deny' ? 'deny' : 'ask',
+    action: str(obj.action) || '(未说明)',
+    facts: list(obj.facts),
+    suggestion: str(obj.suggestion),
+    alternatives: list(obj.alternatives),
+  };
+}
+
+/** 把四元组渲染成卡片文字。 */
+export function renderAsk(q, extraFacts = []) {
+  const lines = ['capgate: ' + q.action];
+  const facts = [...q.facts, ...extraFacts].filter(Boolean).slice(0, 5);
+  if (facts.length) lines.push('事实: ' + facts.join('；'));
+  if (q.suggestion) lines.push('建议: ' + q.suggestion);
+  if (q.alternatives.length) lines.push('可替代: ' + q.alternatives.join(' / '));
+  return lines.join('\n');
+}
+/** 事实列表（给卡片用，逐条）。 */
+export function factList(result, limit = 6) {
+  return (result?.facts ?? []).slice(0, limit).map((f) => {
+    if (f.type === 'fs.exists') return `${f.target} ${f.value ? '存在' : '不存在'}`;
+    if (f.type === 'fs.is_dir') return f.value ? '是目录' : '是文件';
+    if (f.type === 'fs.size') return `大小 ${f.value}B`;
+    if (f.type === 'dir.entries') return `目录内 ${f.value} 项`;
+    if (f.type === 'content.pii') return `PII ${Object.entries(f.value).map(([k, v]) => `${k}×${v}`).join(',')}`;
+    if (f.type === 'content.secret') return `密钥迹象 ${f.value.join(',')}`;
+    if (f.type === 'content.scanned_bytes') return `扫描 ${f.value}B`;
+    if (f.type === 'scope.skipped') return '目标在工作区外（未探查）';
+    return '';
+  }).filter(Boolean);
+}

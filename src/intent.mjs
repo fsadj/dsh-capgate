@@ -131,7 +131,7 @@ export async function extractIntent(ctx, agent, instructions, { context = '', ti
 }
 
 /** 统一的模型调用（provider/model 取当前会话路由）。 */
-async function callModel(ctx, agent, { system, prompt, timeoutMs = 8000 }) {
+export async function callModel(ctx, agent, { system, prompt, timeoutMs = 8000 }) {
   const llm = (() => { try { return ctx.get?.('llm'); } catch { return undefined; } })();
   if (!llm || typeof llm.stream !== 'function') return undefined;
 

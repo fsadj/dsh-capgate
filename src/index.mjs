@@ -15,11 +15,11 @@ import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf, norma
 import { collectInstructionTexts, findCitation, citationSupports, isInterrogative, extractEntities } from './citations.mjs';
 import { collectEvidence, instructionOnly, locateSpan, renderContract, validateIntent, effectiveEntries, intentCovers } from './evidence.mjs';
 import { minimizeOptions, describeMinimize } from './minimize.mjs';
-import { verify, summarizeFacts } from './verifier.mjs';
+import { verify, summarizeFacts, buildAskPrompt, parseAsk, renderAsk, factList } from './verifier.mjs';
 import { inspectScript } from './scriptaudit.mjs';
 import { findReadContent, hashText } from './readlog.mjs';
 import { existsSync, statSync, readFileSync } from 'node:fs';
-import { parseIntent, extractIntent } from './intent.mjs';
+import { parseIntent, extractIntent, callModel } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
 import { loadState, saveState, observe, candidates, addRule, removeRule, hasRule } from './learn.mjs';
@@ -52,6 +52,7 @@ export const DEFAULTS = {
   evidenceTurns: 5,
   verifierScope: 'workspace',
   scriptAudit: 'on',
+  verifierAsk: 'on',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -84,6 +85,7 @@ export const Config = Schema.object({
   evidenceTurns: Schema.number().default(5).description('送给意图抽取的最近对话轮数（只用于消歧，不构成授权）'),
   verifierScope: Schema.union(['workspace', 'any']).default('workspace').description('核查探针的范围：默认只看工作区（软链解析后）'),
   scriptAudit: Schema.union(['off', 'on']).default('on').description('脚本可读化：静态检查无危险 API 的脚本可按引文放行'),
+  verifierAsk: Schema.union(['off', 'on']).default('on').description('询问时由独立 verifier 生成四段式问题（只能收紧）'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -239,10 +241,10 @@ export function apply(ctx, config = {}) {
     return { ok: true, citations, primary };
   }
 
-  const askDecision = (reason, label) => ({
+  const askDecision = (reason, label, display) => ({
     kind: 'ask',
     reason,
-    displayReason: {
+    displayReason: display ?? {
       en: `capgate: ${label}. Needs your decision.`,
       zh: `capgate：${label}。需要你确认。`,
     },
@@ -291,6 +293,66 @@ export function apply(ctx, config = {}) {
       rejected: rejected.length, residual,
     });
     return entries;
+  }
+
+  /**
+   * 会提问的调查员：把"要问人"变成一份四段式问题。
+   * 它只能收紧（verdict=deny）或把问题问得更好，**不能放行**。
+   * 任何失败都退回原来的纯文本问题——绝不因为审查失败而卡住或放行。
+   */
+  async function askViaVerifier(exec, { label, klass, effect, reason, cwd }) {
+    if (cfg.verifierAsk !== 'on') return undefined;
+    try {
+      const ev = collectEvidence(exec.agent, {
+        window: cfg.evidenceWindow, recent: cfg.evidenceRecent, turns: cfg.evidenceTurns,
+      });
+      const instructions = ev.instructions.map((m) => instructionOnly(m.text)).filter(Boolean).join('\n').slice(-1500);
+      const turns = ev.turns
+        .map((t) => [t.user && (`USER: ${t.user}`), t.assistant && (`ASSISTANT: ${t.assistant}`)].filter(Boolean).join('\n'))
+        .join('\n---\n')
+        .slice(-1500);
+      const targets = effect.targets.filter((t) => t.kind === 'path').map((t) => t.value);
+
+      const probe = verify({ op: klass.op, targets }, { scope: { mode: cfg.verifierScope, root: cwd ?? '' } });
+      const facts = factList(probe);
+
+      const text = await callModel(ctx, exec.agent, {
+        system: 'You write one clear review question for a human. Output JSON only.',
+        prompt: buildAskPrompt({
+          tool: exec.name,
+          args: JSON.stringify(exec.arguments ?? {}),
+          op: klass.op,
+          targets,
+          locks: locksOf(klass, effect),
+          facts,
+          instructions,
+          turns,
+        }),
+        timeoutMs: cfg.judgeTimeoutMs,
+      });
+      const q = text ? parseAsk(text) : undefined;
+      // 输出不像一个问题（模型回了别的东西）→ 当作没审查，退回原文案。
+      if (!q || !q.action || q.action === '(未说明)') return undefined;
+
+      // 它要的额外探针：只能指向本次调用的目标，最多 2 个
+      const extra = [];
+      for (const p of q.probes) {
+        if (!targets.includes(p.target)) continue;
+        const r = verify({ op: 'read', targets: [p.target] }, { scope: { mode: cfg.verifierScope, root: cwd ?? '' } });
+        extra.push(...factList(r, 2));
+        if (extra.length >= 3) break;
+      }
+
+      const out = { ...q, text: renderAsk(q, extra.slice(0, 3)) };
+      audit({
+        event: 'ask_review', sid: sidOf(exec.agent), tool: exec.name, class: klass.key,
+        verdict: q.verdict, probes: q.probes.length, reason,
+      });
+      return out;
+    } catch (err) {
+      audit({ event: 'ask_review_failed', sid: sidOf(exec.agent), reason: String(err && err.message ? err.message : err) });
+      return undefined;
+    }
   }
 
   function noteDormant(agent, tool) {
@@ -724,13 +786,21 @@ export function apply(ctx, config = {}) {
       const whyNotGrant = klass.op === 'send' ? '出网需要你确认'
         : effect.opaque ? '不透明执行（脚本/解释器）需要你确认'
         : '需要你确认';
+      const judgeReview = await askViaVerifier(exec, { label, klass, effect, reason: judgement.reason, cwd });
+      if (judgeReview?.verdict === 'deny') {
+        store.bump(sid, 'deny');
+        audit({ event: 'deny', by: 'verifier-ask', sid, tool: exec.name, class: klass.key, reason: judgeReview.text });
+        return { kind: 'deny', reason: judgeReview.text, alternatives: judgeReview.alternatives };
+      }
       return guardAsk(
         exec.agent,
         askDecision(
-          judgement.decision === 'allow'
-            ? `capgate: 首次使用「${label}」，复核认为符合要求，但${whyNotGrant}（${judgement.reason}）`
-            : `capgate: 首次使用「${label}」，复核认为不确定（${judgement.reason}）`,
+          judgeReview?.text
+            ?? (judgement.decision === 'allow'
+              ? `capgate: 首次使用「${label}」，复核认为符合要求，但${whyNotGrant}（${judgement.reason}）`
+              : `capgate: 首次使用「${label}」，复核认为不确定（${judgement.reason}）`),
           label,
+          judgeReview ? { en: judgeReview.text, zh: judgeReview.text } : undefined,
         ),
         label,
       );
@@ -743,11 +813,22 @@ export function apply(ctx, config = {}) {
     });
     store.bump(sid, 'ask');
     audit({ event: 'ask', sid, tool: exec.name, class: klass.key, autoEligible: false, why: evidence.why });
+
+    // 让独立的 verifier 把这次询问写成「动作 / 事实 / 建议 / 可替代」四段式。
+    // 它只能收紧（建议拒绝）或把问题问得更好，不能放行。
+    const review = await askViaVerifier(exec, { label, klass, effect, reason: evidence.why, cwd });
+    if (review?.verdict === 'deny') {
+      store.bump(sid, 'deny');
+      audit({ event: 'deny', by: 'verifier-ask', sid, tool: exec.name, class: klass.key, reason: review.text });
+      return { kind: 'deny', reason: review.text, alternatives: review.alternatives };
+    }
     return guardAsk(
       exec.agent,
       askDecision(
-        `capgate: 首次使用「${label}」，未找到用户原话依据（${evidence.why}）${verifyNote ? `；核查：${verifyNote}` : ''}`,
+        review?.text
+          ?? `capgate: 首次使用「${label}」，未找到用户原话依据（${evidence.why}）${verifyNote ? `；核查：${verifyNote}` : ''}`,
         label,
+        review ? { en: review.text, zh: review.text } : undefined,
       ),
       label,
     );
