@@ -33,3 +33,10 @@ test('批量 + 出网会同时命中两个锁', () => {
   assert.ok(locks.includes('batch'));
   assert.ok(locks.includes('opaque') === false);
 });
+
+test('提权是独立的锁，且前缀会被剥离后再判效果', () => {
+  assert.deepEqual(locksFor('pwsh', { command: 'sudo rm -rf /tmp/x' }), ['privilege']);
+  assert.deepEqual(locksFor('pwsh', { command: 'runas /user:admin cmd /c del x' }), ['privilege']);
+  const plain = locksFor('pwsh', { command: 'rm -rf /tmp/x' });
+  assert.ok(!plain.includes('privilege'), '没有提权就不该有 privilege 锁');
+});

@@ -32,7 +32,7 @@
         minimize: true
         maxConsecutiveDenials: 3
         grantTtlHours: 8
-        judgeMode: off
-        judgeAutoAllow: false
+        judgeMode: residual
+        judgeAutoAllow: true
         auditPath: ''
         learnPath: ''

@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 效果抽取与效果类判定（纯函数，无 DSH 依赖，可单测）。
  *
  * 设计要点：判定单元是"效果类"而不是"工具名"、也不是"计划"。
@@ -108,6 +108,15 @@ function looksLikePath(t) {
 /** 解析一条 shell 命令为效果；`depth` 防止无限拆包。 */
 export function parseShell(command, cwd, depth = 0) {
   let text = String(command ?? '');
+
+  // 提权前缀：`sudo rm x` 的真实效果是 `rm x`，先记下"提权过"再去掉前缀，
+  // 否则整条会被当成未知命令，看不到里面到底在干什么。
+  const elevated = /\b(sudo|doas|runas|psexec|gsudo|Start-Process\b[^;|]*?-Verb\s+RunAs|\bsu\s+-)/i.test(text);
+  text = text
+    .replace(/^\s*(?:sudo|doas|gsudo)\s+/i, '')
+    .replace(/^\s*runas\s+\/user:\S+\s+/i, '')
+    .replace(/^\s*psexec\b[^;|]*?\s+((?:-\S+\s+)*)/i, '');
+
   const wrapped = depth < 4 && SHELL_WRAP.test(text);
   if (wrapped) text = text.replace(SHELL_WRAP, (_m, _q, inner) => String(inner));
 
@@ -220,6 +229,7 @@ export function parseShell(command, cwd, depth = 0) {
     wildcard,
     wrapped,
     opaque,
+    elevated,
     source: 'shell',
     raw: text.slice(0, 400),
   };
@@ -416,6 +426,7 @@ export const LOCKS = {
   batch: '批量/通配（一条批准不能变成批量许可证）',
   egress: '出网（数据离开本机）',
   opaque: '不透明执行（脚本内部不可见）',
+  privilege: '提权（跨权限边界）',
   unknown: '未知效果（命令语义无法确定）',
 };
 
@@ -429,6 +440,7 @@ export function locksOf(klass, effect) {
   if (cardinalityOf(effect) === 'many') out.push('batch');
   if (klass.op === 'send') out.push('egress');
   if (effect.opaque) out.push('opaque');
+  if (effect.elevated) out.push('privilege');
   if (klass.op === 'other') out.push('unknown');
   return out;
 }
