@@ -15,22 +15,36 @@ import { readFileSync, statSync, existsSync } from 'node:fs';
 
 export const DEFAULT_MAX_BYTES = 64 * 1024;
 
-/** 危险 API：命中任意一条，就**不再**认为脚本是只读的。 */
-const DANGEROUS = [
+/**
+ * 严重 API：命中任意一条 → **否决**（即使被用户点名也问人）。
+ * 这些是"脚本自己决定后果"的特征：起子进程、写/删盘、出网、动态执行。
+ */
+const SEVERE = [
   [/require\(\s*['"]child_process['"]\s*\)/, 'child_process'],
-  [/from\s+['"]node:child_process['"]/, 'child_process'],
-  [/\bexecSync?\s*\(/, 'exec'],
-  [/\bspawnSync?\s*\(/, 'spawn'],
-  [/\.(write|writeFile|writeFileSync|appendFile|appendFileSync)\s*\(/, 'fs.write'],
-  [/\.(unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|rename|renameSync)\s*\(/, 'fs.delete'],
-  [/\bfs\.(mkdir|mkdirSync|copyFile|copyFileSync|chmod|chmodSync)\s*\(/, 'fs.write'],
-  [/from\s+['"](node:)?(fs|net|http|https|dgram|tls|dns)['"]/, 'network-or-fs'],
-  [/\b(fetch|http\.request|https\.request|net\.connect)\s*\(/, 'network'],
+  [/from\s+['"](node:)?child_process['"]/, 'child_process'],
+  [/\b(exec|execSync|execFile|execFileSync|spawn|spawnSync|fork)\s*\(/, 'spawn'],
+  [/\.?(write|writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|createReadStream)\s*\(/, 'fs.write'],
+  [/\.?(unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|rename|renameSync|truncate|truncateSync)\s*\(/, 'fs.delete'],
+  [/\.?(mkdir|mkdirSync|copyFile|copyFileSync|chmod|chmodSync)\s*\(/, 'fs.write'],
+  [/from\s+['"](node:)?(net|http|https|dgram|tls|dns)['"]/, 'network'],
+  [/\b(fetch|http\.request|https\.request|net\.connect|axios|got)\s*[.(]/, 'network'],
   [/\beval\s*\(/, 'eval'],
   [/new\s+Function\s*\(/, 'Function'],
   [/\bimport\s*\(/, 'dynamic-import'],
   [/\bDeno\.(run|writeFile|remove)\b/, 'deno'],
   [/process\.(exit|kill)\s*\(/, 'process'],
+];
+
+/**
+ * 提示级：只说明"脚本会读文件"，不构成否决。
+ * 用户点名要跑一个读文件的脚本，本来就该允许——读什么由脚本决定，
+ * 但读到的内容不会因为我们没拦就离开本机（出网在上面的严重级里）。
+ */
+const NOTEWORTHY = [
+  [/from\s+['"](node:)?fs['"]/, 'reads-files'],
+  [/require\(\s*['"]fs['"]\s*\)/, 'reads-files'],
+  [/\breadFile(Sync)?\s*\(/, 'reads-files'],
+  [/\b(fs\.)?(readdir|stat|lstat|access)(Sync)?\s*\(/, 'reads-files'],
 ];
 
 /**
@@ -54,15 +68,20 @@ export function inspectScript(target, { maxBytes = DEFAULT_MAX_BYTES, content } 
     const text = fromSession ? content : readFileSync(target, 'utf8');
     facts.push({ type: 'script.source', target, value: fromSession ? 'session-read' : 'fs' });
     const hits = [];
-    for (const [re, name] of DANGEROUS) {
+    for (const [re, name] of SEVERE) {
       if (re.test(text)) hits.push(name);
+    }
+    const notes = [];
+    for (const [re, name] of NOTEWORTHY) {
+      if (re.test(text)) notes.push(name);
     }
     facts.push({ type: 'script.size', target, value: size ?? Buffer.byteLength(text, 'utf8') });
     if (hits.length > 0) {
       facts.push({ type: 'script.risky_apis', target, value: [...new Set(hits)] });
       return { kind: 'risky', facts, reason: `脚本引用了 ${[...new Set(hits)].join(', ')}` };
     }
-    facts.push({ type: 'script.read_only', target, value: true });
+    if (notes.length > 0) facts.push({ type: 'script.reads_files', target, value: [...new Set(notes)] });
+    facts.push({ type: 'script.no_severe_api', target, value: true });
     return { kind: 'ok', facts };
   } catch (err) {
     return { kind: 'unreadable', facts: [{ type: 'script.unreadable', target, value: String(err && err.message ? err.message : err) }] };

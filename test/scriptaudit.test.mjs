@@ -15,7 +15,7 @@ test('只有 console.log 的脚本 → 判为只读', () => withTmp((dir) => {
   writeFileSync(f, "console.log('hello')\n");
   const r = inspectScript(f);
   assert.equal(r.kind, 'ok');
-  assert.ok(r.facts.some((x) => x.type === 'script.read_only'));
+  assert.ok(r.facts.some((x) => x.type === 'script.no_severe_api'));
 }));
 
 test('写文件的脚本 → 判为 risky', () => withTmp((dir) => {
@@ -53,4 +53,19 @@ test('文件不存在 / 非文件 / 过大 → 不判只读', () => withTmp((dir
   const big = join(dir, 'big.mjs');
   writeFileSync(big, 'x'.repeat(2048));
   assert.equal(inspectScript(big, { maxBytes: 1024 }).kind, 'risky');
+}));
+
+test('只读文件的脚本 → 不否决，只记录"会读文件"', () => withTmp((dir) => {
+  const f = join(dir, 'check.mjs');
+  writeFileSync(f, "import { readFileSync } from 'node:fs'\nconsole.log(readFileSync('data.json','utf8'))\n");
+  const r = inspectScript(f);
+  assert.equal(r.kind, 'ok');
+  assert.ok(r.facts.some((x) => x.type === 'script.reads_files'));
+  assert.ok(!r.facts.some((x) => x.type === 'script.risky_apis'));
+}));
+
+test('既读又写 → 仍然否决', () => withTmp((dir) => {
+  const f = join(dir, 'mix.mjs');
+  writeFileSync(f, "import { readFileSync, writeFileSync } from 'node:fs'\nwriteFileSync('o', readFileSync('i'))\n");
+  assert.equal(inspectScript(f).kind, 'risky');
 }));
