@@ -17,6 +17,7 @@ import { collectEvidence, instructionOnly, locateSpan, renderContract, validateI
 import { minimizeOptions, describeMinimize } from './minimize.mjs';
 import { verify, summarizeFacts } from './verifier.mjs';
 import { inspectScript } from './scriptaudit.mjs';
+import { findReadContent } from './readlog.mjs';
 import { existsSync, statSync } from 'node:fs';
 import { parseIntent, extractIntent } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
@@ -469,12 +470,15 @@ export function apply(ctx, config = {}) {
         .map((t) => t.value)
         .find((v) => { try { return existsSync(v) && statSync(v).isFile(); } catch { return false; } });
       if (scriptPath) {
-        scriptInfo = inspectScript(scriptPath);
+        // 先用 agent 自己读过的那份内容（可审计、可对账），没有再自己读盘
+        const seen = findReadContent(exec.agent, scriptPath, { cwd });
+        scriptInfo = inspectScript(scriptPath, seen ? { content: seen.content } : {});
         audit({
           event: 'script', sid, tool: exec.name, script: scriptPath, kind: scriptInfo.kind,
+          source: seen ? 'session-read' : 'fs', readCallId: seen?.callId,
           facts: scriptInfo.facts.map((f) => f.type), reason: scriptInfo.reason,
         });
-        if (scriptInfo.kind === 'ok') console.log(`[capgate] script-read-only ${scriptPath}`);
+        if (scriptInfo.kind === 'ok') console.log(`[capgate] script-read-only ${scriptPath} (${seen ? 'session' : 'fs'})`);
       }
     }
 

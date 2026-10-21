@@ -37,21 +37,27 @@ const DANGEROUS = [
  * 检查一个脚本文件。
  * @returns {{kind:'ok'|'risky'|'unreadable'|'not-a-file', facts:object[], reason?:string}}
  */
-export function inspectScript(target, { maxBytes = DEFAULT_MAX_BYTES } = {}) {
+export function inspectScript(target, { maxBytes = DEFAULT_MAX_BYTES, content } = {}) {
   const facts = [];
   try {
-    if (!target || !existsSync(target)) return { kind: 'unreadable', facts: [{ type: 'script.missing', target }] };
-    const st = statSync(target);
-    if (!st.isFile()) return { kind: 'not-a-file', facts: [{ type: 'script.not_a_file', target }] };
-    if (st.size > maxBytes) {
-      return { kind: 'risky', facts: [{ type: 'script.too_large', target, value: st.size }], reason: '脚本过大，不做静态检查' };
+    const fromSession = typeof content === 'string';
+    let size;
+    if (!fromSession) {
+      if (!target || !existsSync(target)) return { kind: 'unreadable', facts: [{ type: 'script.missing', target }] };
+      const st = statSync(target);
+      if (!st.isFile()) return { kind: 'not-a-file', facts: [{ type: 'script.not_a_file', target }] };
+      if (st.size > maxBytes) {
+        return { kind: 'risky', facts: [{ type: 'script.too_large', target, value: st.size }], reason: '脚本过大，不做静态检查' };
+      }
+      size = st.size;
     }
-    const text = readFileSync(target, 'utf8');
+    const text = fromSession ? content : readFileSync(target, 'utf8');
+    facts.push({ type: 'script.source', target, value: fromSession ? 'session-read' : 'fs' });
     const hits = [];
     for (const [re, name] of DANGEROUS) {
       if (re.test(text)) hits.push(name);
     }
-    facts.push({ type: 'script.size', target, value: st.size });
+    facts.push({ type: 'script.size', target, value: size ?? Buffer.byteLength(text, 'utf8') });
     if (hits.length > 0) {
       facts.push({ type: 'script.risky_apis', target, value: [...new Set(hits)] });
       return { kind: 'risky', facts, reason: `脚本引用了 ${[...new Set(hits)].join(', ')}` };
