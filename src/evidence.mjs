@@ -170,9 +170,11 @@ export function intentCovers(entries, { op, targets } = {}) {
   const list = (entries ?? []).filter((e) => e.op === op);
   if (list.length === 0) return undefined;
   const norm = (s) => String(s).replace(/\\/g, '/').toLowerCase();
+  // 数据库目标的内部表示带 `db:` 前缀；模型抽出来的是裸表名，比较时统一剥掉。
+  const bare = (s) => norm(s).replace(/^db:/, '');
   const covered = (t) => list.find((e) => {
-    const p = norm(e.target);
-    const v = norm(t);
+    const p = bare(e.target);
+    const v = bare(t);
     if (!p) return false;
     if (p === v) return true;
     if (/[*?]/.test(p)) {

@@ -127,6 +127,24 @@ test('上一个任务的授权不能漏到下一个任务（默认只看最后�
   assert.notEqual(d.kind, 'allow', '旧任务的授权必须失效');
 });
 
+test('语义引文：数据库表名（不带 db: 前缀）也能覆盖', async () => {
+  const call = harness(
+    '把用户表里测试账号的邮箱改掉',
+    JSON.stringify({ entries: [{ op: 'write', target: 'users', quote: '用户表' }], residual: false }),
+  );
+  const d = await call('sql', { query: "UPDATE users SET email='x' WHERE id=1" });
+  assert.equal(d.kind, 'allow', '表名对上就该放行');
+});
+
+test('语义引文：无 WHERE 的批量删除仍然问人', async () => {
+  const call = harness(
+    '把用户表里的测试账号删掉',
+    JSON.stringify({ entries: [{ op: 'delete', target: 'users', quote: '用户表' }], residual: false }),
+  );
+  const d = await call('sql', { query: 'DELETE FROM users' });
+  assert.equal(d.kind, 'ask', 'destructive SQL 有 batch 锁');
+});
+
 test('显式配置 window=session 时才看整个会话', async () => {
   const call = harnessWithHistory([
     `把 ${HOME}/Downloads/a.zip 删掉`,

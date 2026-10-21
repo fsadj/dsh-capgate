@@ -80,12 +80,13 @@ export async function compileEffects(ctx, agent, call, { timeoutMs = 8000 } = {}
 export function buildIntentPrompt(instructions, context = '') {
   return [
     'You read a user\'s instructions and write down the MINIMUM data access they authorize.',
-    'Return ONLY JSON: {"entries":[{"op":"read|write|delete|send|execute","target":"<literal path or host>","quote":"<exact substring copied from the instructions>"}],"residual":false}',
+    'Return ONLY JSON: {"entries":[{"op":"read|write|delete|send|execute","target":"<literal path, host, or table name>","quote":"<exact substring copied from the instructions>"}],"residual":false}',
     '',
     'Rules:',
     '- quote MUST be an exact substring of the instructions below. Do not paraphrase.',
     '- Write the MINIMUM scope the task needs, not the maximum the user might mean.',
     '- Keep hedges exact: "先看看" is read, "删了也行" is not a directive, "除了一季度" is an exclusion.',
+    '- For database work the target is the TABLE NAME as written in the statement (e.g. users).',
     '- If the user did not authorize any concrete data access, return {"entries":[],"residual":true}.',
     '- residual=true when the instruction is too vague to derive literal targets.',
     '',

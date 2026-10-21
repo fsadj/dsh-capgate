@@ -603,8 +603,11 @@ export function apply(ctx, config = {}) {
       if (locksNow.length === 0 || (locksNow.length === 1 && locksNow[0] === 'unknown')) {
         try {
           const entries = await ensureIntent(exec.agent, sid);
-          const pathTargets = effect.targets.filter((t) => t.kind === 'path').map((t) => t.value);
-          const hit = intentCovers(entries, { op: klass.op, targets: pathTargets });
+          // 路径和表名都参与比较：数据库目标内部带 db: 前缀，intentCovers 会统一剥掉。
+          const cmpTargets = effect.targets
+            .filter((t) => t.kind === 'path' || t.kind === 'db')
+            .map((t) => t.value);
+          const hit = intentCovers(entries, { op: klass.op, targets: cmpTargets });
           if (hit) {
             console.log('[capgate] intent-grant ' + klass.key);
             store.grant(sid, klass.key, { via: 'intent' });
