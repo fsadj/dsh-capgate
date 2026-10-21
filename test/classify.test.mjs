@@ -1,6 +1,6 @@
-import { test } from 'node:test';
+﻿import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseShell, effectOf, classify, describeClass, cardinalityOf } from '../src/classify.mjs';
+import { parseShell, effectOf, effectOfSchema, classify, describeClass, cardinalityOf } from '../src/classify.mjs';
 
 const ROOT = 'C:/repo';
 
@@ -131,4 +131,35 @@ test('会"变成另一条命令"的构造失去只读资格', () => {
     const e = parseShell(cmd, ROOT);
     assert.notEqual(e.op, 'read', `${cmd} 不能被证明为只读`);
   }
+});
+
+test('用工具 schema 推效果（MCP/第三方工具）', () => {
+  const del = effectOfSchema(
+    { name: 'mcp__fs__deleteFile', description: 'Delete a file', parameters: { properties: { paths: { type: 'array' } } } },
+    { paths: ['C:/Users/me/Downloads/a.zip', 'C:/Users/me/Downloads/b.zip'] },
+    ROOT,
+  );
+  assert.equal(del.op, 'delete');
+  assert.equal(del.targets.length, 2);
+  assert.equal(del.source, 'schema');
+
+  const post = effectOfSchema(
+    { name: 'mcp__http__request', description: 'POST to an endpoint', parameters: { properties: { url: {}, body: {} } } },
+    { url: 'https://paste.rs', body: 'secret' },
+    ROOT,
+  );
+  assert.equal(post.op, 'send');
+  assert.equal(post.targets[0].value, 'paste.rs');
+
+  const read = effectOfSchema(
+    { name: 'mcp__db__query', description: 'Run a read-only query', parameters: { properties: { sql: {} } } },
+    { sql: 'select 1' },
+    ROOT,
+  );
+  assert.equal(read.op, 'read', '描述里说 read 才算读');
+});
+
+test('schema 推不出效果时返回 undefined（回退到启发式/问人）', () => {
+  const unknown = effectOfSchema({ name: 'mcp__misc__do', description: '', parameters: {} }, { foo: 1 }, ROOT);
+  assert.equal(unknown, undefined);
 });

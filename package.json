@@ -15,7 +15,8 @@
     "client.js",
     "scripts",
     "test",
-    "examples",`n    "docs",
+    "examples",
+    "docs",
     "cordis.patch.yml",
     "README.md",
     "CHANGELOG.md",
@@ -26,7 +27,7 @@
   },
   "scripts": {
     "setup": "node scripts/setup.mjs",
-    "test": "node --test test/classify.test.mjs test/citations.test.mjs test/flow.test.mjs test/rules.test.mjs test/parity.test.mjs test/escalation.test.mjs test/learn.test.mjs",
+    "test": "node --test test/classify.test.mjs test/citations.test.mjs test/flow.test.mjs test/rules.test.mjs test/parity.test.mjs test/escalation.test.mjs test/learn.test.mjs test/schema.test.mjs",
     "bench": "node bench/heldout.mjs",
     "demo": "node scripts/demo.mjs",
     "e2e": "node scripts/e2e.mjs"

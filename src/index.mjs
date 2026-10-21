@@ -11,7 +11,7 @@
  *   3. 出网与不透明执行（脚本/解释器）不能由模型复核放行。
  */
 import Schema from '@deepseek-ai/schemastery';
-import { effectOf, classify, describeClass, cardinalityOf } from './classify.mjs';
+import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf } from './classify.mjs';
 import { collectInstructionTexts, findCitation, citationSupports, isInterrogative, extractEntities } from './citations.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
@@ -140,11 +140,31 @@ export function apply(ctx, config = {}) {
     } catch { return undefined; }
   }
 
+  /** 从 tools 注册表取工具定义（含参数 schema）。取不到就返回 undefined。 */
+  function toolDefinition(callName, agent) {
+    try {
+      const tools = ctx.get?.('tools');
+      const def = tools && typeof tools.get === 'function' ? tools.get(callName, agent) : undefined;
+      return def && typeof def === 'object' ? def : undefined;
+    } catch { return undefined; }
+  }
+
   function classOfCall(agent, callName, args) {
     try {
       const cwd = cwdOf(agent);
-      const effect = effectOf(callName, args, cwd);
-      return { effect, klass: classify(effect, { root: cwd }), cwd };
+      // 先用工具自己声明的 schema 推效果（对 MCP/第三方工具是唯一可靠来源），
+      // 推不出来再回退到按参数名/命令文本的启发式。
+      // **shell 工具例外**：它的效果在 command 文本里，schema 只能说"有个 command 参数"，
+      // 拿 schema 判 pwsh 会把 `Remove-Item` 误判成读——这是真机验证时抓到的。
+      const SHELL_TOOLS = new Set(['pwsh', 'powershell', 'bash', 'sh', 'shell', 'cmd', 'run_command']);
+      const def = SHELL_TOOLS.has(callName) ? undefined : toolDefinition(callName, agent);
+      const fromSchema = def ? effectOfSchema(def, args, cwd) : undefined;
+      const effect = fromSchema ?? effectOf(callName, args, cwd);
+      if (fromSchema && !schemaSeen.has(callName)) {
+        schemaSeen.add(callName);
+        console.log(`[capgate] schema-classified ${callName} -> ${classify(fromSchema, { root: cwd }).key}`);
+      }
+      return { effect, klass: classify(effect, { root: cwd }), cwd, viaSchema: !!fromSchema };
     } catch (err) {
       console.warn('[capgate] classify failed:', redact(String(err)));
       return undefined;
@@ -212,6 +232,7 @@ export function apply(ctx, config = {}) {
   // 休眠不是"静默"：一旦因为模式/预设不匹配而不接管，至少留一条审计，
   // 否则事后看日志会分不清"插件没拦"和"插件没在看"。
   const dormantSeen = new Set();
+  const schemaSeen = new Set();
   function noteDormant(agent, tool) {
     const sid = sidOf(agent);
     const reason = mode() !== 'capgate' ? 'mode=standard' : `preset!=${cfg.requiredPreset}`;
@@ -690,8 +711,15 @@ export function apply(ctx, config = {}) {
     ctx.systemPrompt?.section?.({
       name: 'tool:capgate',
       order: 1200,
-      text: 'capgate: 首次使用某类数据操作会被询问；项目内普通读直接放行；'
-        + '被拒绝时不要换等价写法重试，改为说明为什么需要，或在项目内完成。',
+      text: [
+        'capgate 会在工具真正执行前判定"这次调用会产生什么效果"，所以请让效果**显式**：',
+        '1) 能用类型化工具就不要用 shell：写文件用 write，不要用 `>` / `Set-Content`；',
+        '   删改文件用带路径参数的工具，不要用变量拼接或脚本解释器。',
+        '2) 需要越界（项目外路径、放宽沙箱）时，先在 justification 里写**完整绝对路径、目标数量、总大小**；',
+        '   卡片上信息越具体，用户越容易一次批准。',
+        '3) 批量操作先列出目标清单再执行；"清理一下某个目录"这类模糊指令不构成删除授权。',
+        '4) 被拒绝时不要换等价写法重试——说明为什么需要它，或改在项目内完成。',
+      ].join('\n'),
     });
   } catch { /* 没有 systemPrompt 服务的组合忽略 */ }
 

@@ -220,6 +220,83 @@ export function parseShell(command, cwd, depth = 0) {
 
 const FS_FIELD_ORDER = ['path', 'file_path', 'filePath', 'target', 'dir', 'directory'];
 
+/** 参数里哪些字段名像"路径"（含复数与常见变体）。 */
+const PATH_FIELD_RE = /^(.*(path|file|dir|folder|target|dest|dst|src|source)s?)$/i;
+/** 参数里哪些字段名像"外发目标"。 */
+const HOST_FIELD_RE = /^(.*(url|uri|endpoint|host|webhook|callback)s?)$/i;
+
+const SCHEMA_OP_HINTS = [
+  ['send', /(upload|publish|post|send|submit|share|push|webhook|notify|tweet|email)/i],
+  ['delete', /(delete|remove|\brm\b|destroy|trash|purge|drop|unlink|erase)/i],
+  ['write', /(write|create|save|edit|update|put|append|mkdir|move|rename|copy|patch|apply)/i],
+  ['execute', /(exec|run|command|shell|spawn|invoke|script|eval)/i],
+  ['read', /(read|get|list|search|query|fetch|view|show|describe|stat|glob|grep)/i],
+];
+
+function collectByField(args, re) {
+  const out = [];
+  for (const [k, v] of Object.entries(args ?? {})) {
+    if (!re.test(k)) continue;
+    if (typeof v === 'string' && v.trim()) out.push(v.trim());
+    else if (Array.isArray(v)) for (const x of v) if (typeof x === 'string' && x.trim()) out.push(x.trim());
+  }
+  return out;
+}
+
+/**
+ * 用**工具自己声明的 schema** 推效果，而不是猜命令文本。
+ *
+ * 这是泛化到第三方/MCP 工具的关键：参数类型就是效果类型，
+ * 工具名字撒谎也没用（名字只用来提示 op，路径/URL 参数才是事实）。
+ *
+ * @param definition - tools 注册表里的定义（含 name / description / parameters）
+ * @returns 效果对象；推不出时返回 undefined，交给调用方回退
+ */
+export function effectOfSchema(definition, args, cwd) {
+  const name = String(definition?.name ?? '');
+  const desc = String(definition?.description ?? '');
+  const hay = `${name} ${desc}`;
+  const a = args && typeof args === 'object' ? args : {};
+
+  const paths = collectByField(a, PATH_FIELD_RE);
+  const hosts = collectByField(a, HOST_FIELD_RE);
+
+  let op = 'other';
+  // 名字比描述更可信：先在名字里找动词，找不到再看描述。
+  const fromName = SCHEMA_OP_HINTS.find(([, re]) => re.test(name));
+  const fromDesc = () => SCHEMA_OP_HINTS.find(([, re]) => re.test(desc));
+  if (/read[- ]?only/i.test(desc) || /read[- ]?only/i.test(name)) op = 'read';
+  else if (fromName) op = fromName[0];
+  else {
+    const d = fromDesc();
+    if (d) op = d[0];
+  }
+
+  // schema 里完全没有路径/URL 参数，又推不出 op → 不知道（保留 other）
+  if (paths.length === 0 && hosts.length === 0 && op === 'other') return undefined;
+
+  const targets = [
+    ...hosts.map((h) => ({ kind: 'host', value: hostOf(h) ?? h.toLowerCase() })),
+    ...paths.map((p) => ({ kind: 'path', value: normalizePath(p, cwd) })),
+  ];
+  if (targets.length === 0) targets.push({ kind: 'path', value: normalizePath('.', cwd) });
+
+  // URL 里塞了长参数 = 在用 GET 外带数据，按外发处理（否则"读网页"会变成数据出口）
+  const urlCarriesData = hosts.some((h) => {
+    const q = String(h).split('?')[1] ?? '';
+    return q.length > 40 || /[=][A-Za-z0-9+/_-]{32,}/.test(q);
+  });
+
+  return {
+    op: urlCarriesData ? 'send' : (op === 'other' && hosts.length > 0 ? 'send' : op),
+    targets,
+    wildcard: paths.some((p) => /[*?]/.test(p)),
+    opaque: false,
+    source: 'schema',
+    raw: `${name}(${Object.keys(a).join(',')})`,
+  };
+}
+
 /** 工具调用 → 效果。未知工具按 `other` 处理（→ 一定问人）。 */
 export function effectOf(tool, args, cwd) {
   const a = args && typeof args === 'object' ? args : {};
