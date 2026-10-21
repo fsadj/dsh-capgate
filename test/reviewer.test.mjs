@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { REVIEW_SCHEMA, REVIEW_TOOLS, buildReviewPrompt, reviewWithAgent } from '../src/reviewer.mjs';
+import { REVIEW_SCHEMA, REVIEW_TOOLS, buildReviewPrompt, reviewWithAgent, clearReviewCache } from '../src/reviewer.mjs';
 
 const input = {
   tool: 'pwsh',
@@ -53,6 +53,7 @@ function fakeCtx(runResult, { providers = ['in-process'] } = {}) {
 }
 
 test('把请求交给独立 agent：只读工具 + 结构化 schema + 单层深度', async () => {
+  clearReviewCache();
   const ctx = fakeCtx({ structured: { verdict: 'ask', action: '执行构建脚本', facts: ['脚本存在'] } });
   const out = await reviewWithAgent(ctx, { id: 'a' }, input);
   assert.equal(out.verdict, 'ask');
@@ -71,11 +72,13 @@ test('agent 给 allow 也会被归一化成 ask（策略才决定放行）', asy
 });
 
 test('没有 subagent 服务 → 返回 undefined（调用方退化）', async () => {
+  clearReviewCache();
   const out = await reviewWithAgent({ get: () => undefined }, {}, input);
   assert.equal(out, undefined);
 });
 
 test('agent 抛错 → 返回 undefined，不阻塞', async () => {
+  clearReviewCache();
   const ctx = {
     get: () => ({
       list: () => ['in-process'],
@@ -86,6 +89,7 @@ test('agent 抛错 → 返回 undefined，不阻塞', async () => {
 });
 
 test('没有结构化结果时，从文本里兜底解析', async () => {
+  clearReviewCache();
   const ctx = fakeCtx({
     output: [{ type: 'text', text: '{"verdict":"deny","action":"越界删除","facts":["目标在用户没提的目录"]}' }],
   });

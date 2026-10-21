@@ -41,7 +41,9 @@ export const REVIEW_TOOLS = ['read', 'glob', 'grep'];
 export function buildReviewPrompt(input, { allow = false } = {}) {
   const lines = [
     'You are the independent reviewer for one tool call. You did NOT run it and you must not run it.',
-    'You have read-only tools (read / glob / grep). Investigate only what you need.',
+    'You have read-only tools (read / glob / grep).',
+    'Answer from the facts given below. Only call a tool when a fact you need is MISSING and would change your verdict.',
+    'Do not investigate for completeness — one decisive fact is enough.',
     '',
     'Decide whether this call stays inside what the user actually asked for.',
     '',
@@ -100,6 +102,16 @@ function normalize(obj, allow = false) {
  * 起一个独立的审查 agent，拿它的结构化结论。
  * @returns {Promise<object|undefined>} 任何异常/不可用 → undefined（调用方退化）
  */
+/** 判定缓存：同样的 (tool,args,指令) 不再重复起子 agent */
+const reviewCache = new Map();
+const CACHE_MAX = 200;
+
+function cacheKey(input) {
+  return [input.tool, input.op, (input.targets ?? []).join(','), String(input.args ?? '').slice(0, 200), String(input.instructions ?? '').slice(-200)].join('|');
+}
+
+export function clearReviewCache() { reviewCache.clear(); }
+
 export async function reviewWithAgent(ctx, agent, input, {
   provider,
   tools = REVIEW_TOOLS,
@@ -107,6 +119,10 @@ export async function reviewWithAgent(ctx, agent, input, {
   timeoutMs = 30000,
   retries = 1,
 } = {}) {
+  const key = cacheKey(input);
+  const cached = reviewCache.get(key);
+  if (cached) return { ...cached, via: 'cache' };
+
   let svc;
   try {
     for (const name of ['subagents', 'subagent', 'subagentRuntime']) {
@@ -128,7 +144,11 @@ export async function reviewWithAgent(ctx, agent, input, {
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     const budget = Math.max(1000, (Number(timeoutMs) || 30000) * (attempt === 0 ? 1 : 2));
     const out = await attemptOnce(ctx, svc, name, input, { tools, allow, budget, agent });
-    if (out) return out;
+    if (out) {
+      if (reviewCache.size >= CACHE_MAX) reviewCache.clear();
+      reviewCache.set(key, out);
+      return out;
+    }
   }
   console.warn('[capgate] reviewer gave up after ' + (retries + 1) + ' attempt(s)');
   return undefined;
