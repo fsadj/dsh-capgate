@@ -1,4 +1,4 @@
-﻿/**
+/**
  * capgate —— 效果类摊销授权（effect-class amortized authorization）。
  *
  * 判定链：
@@ -11,7 +11,7 @@
  *   3. 出网与不透明执行（脚本/解释器）不能由模型复核放行。
  */
 import Schema from '@deepseek-ai/schemastery';
-import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf, normalizePath } from './classify.mjs';
+import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf, normalizePath, locksOf } from './classify.mjs';
 import { collectInstructionTexts, findCitation, citationSupports, isInterrogative, extractEntities } from './citations.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
@@ -512,8 +512,8 @@ export function apply(ctx, config = {}) {
       }
 
       // LLM 复核只能"减问"，不能"放权"：
-      // 只允许它在**低风险层**（项目内、非敏感、非批量、非出网、非不透明）直接放行；
-      // 删除/出网/批量/越界/脚本一律只能 deny 或 ask，绝不由模型替人签字。
+      // 命中任何"锁死类别"（LOCKS）就绝不由复核放行；否则只允许它在
+      // 低风险层（项目内、非敏感、非批量、非出网、非不透明）直接放行。
       //
       // 例外（压 ask）：shell 里的"未知命令"，如果复核说 allow **且**命令文本里
       // 没有任何变更迹象，就按纯读处理。两路独立意见都无害才放行。
@@ -521,17 +521,11 @@ export function apply(ctx, config = {}) {
         && klass.op === 'other'
         && !MUTATION_HINT.test(String(effect.raw ?? ''));
 
+      const locks = locksOf(klass, effect);
+      const hardLocked = locks.filter((l) => l !== 'unknown' || !shellUnknownButClean);
       const judgeMayGrant = cfg.judgeAutoAllow
-        && klass.op !== 'send'
-        && !effect.opaque
-        && (shellUnknownButClean || (
-          klass.op !== 'other'
-          && (process.env.CAPGATE_NO_TIER === '1' || (
-            klass.scope === 'workspace'
-            && klass.sensitivity !== 'sensitive'
-            && cardinalityOf(effect) !== 'many'
-          ))
-        ));
+        && hardLocked.length === 0
+        && (process.env.CAPGATE_NO_TIER === '1' || klass.scope === 'workspace');
       if (judgement.decision === 'allow' && judgeMayGrant) {
         store.grant(sid, klass.key, { via: 'judge' });
         store.bump(sid, 'grant');

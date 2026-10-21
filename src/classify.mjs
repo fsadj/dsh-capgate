@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 效果抽取与效果类判定（纯函数，无 DSH 依赖，可单测）。
  *
  * 设计要点：判定单元是"效果类"而不是"工具名"、也不是"计划"。
@@ -182,7 +182,9 @@ export function parseShell(command, cwd, depth = 0) {
     const host = hostOf(m[0]);
     if (host) targets.push({ kind: 'host', value: host });
   }
-  const wantPaths = op !== 'send' || targets.length === 0;
+  // 外发命令里如果还夹着删除/写入，目标也要抽出来（混合命令不能只记主机）
+  const wantPaths = op !== 'send' || targets.length === 0
+    || hasVerb(CMD_SETS.delete) || hasVerb(CMD_SETS.write);
   if (wantPaths) {
     const tokens = text.split(/[\s;|&]+/);
     let lastToken = '';
@@ -398,6 +400,37 @@ export function classify(effect, scope) {
     cardinality: card,
     underRoot: paths.every((p) => inside(p, root)),
   };
+}
+
+/**
+ * 锁死类别：命中任意一条，就**不允许任何自动化路径放行**（只能问人或拒绝）。
+ *
+ * 借鉴 dsh-auto-approval-llm 的 LOCKED_CATEGORIES 写法，把"永远只能 ask"
+ * 显式列出来——这样口径在代码里一眼可见，也便于审计与文档对齐。
+ *
+ * 注意：这里的"锁死"约束的是**自动放行**（引文/类摊销/复核/编译），
+ * 不是拒绝——被锁的调用仍然可以经人批准执行。
+ */
+export const LOCKS = {
+  sensitive: '敏感路径（凭据/密钥）',
+  batch: '批量/通配（一条批准不能变成批量许可证）',
+  egress: '出网（数据离开本机）',
+  opaque: '不透明执行（脚本内部不可见）',
+  unknown: '未知效果（命令语义无法确定）',
+};
+
+/**
+ * 一条效果命中了哪些锁。空数组 = 可被自动放行。
+ * @returns {(keyof typeof LOCKS)[]}
+ */
+export function locksOf(klass, effect) {
+  const out = [];
+  if (klass.sensitivity === 'sensitive') out.push('sensitive');
+  if (cardinalityOf(effect) === 'many') out.push('batch');
+  if (klass.op === 'send') out.push('egress');
+  if (effect.opaque) out.push('opaque');
+  if (klass.op === 'other') out.push('unknown');
+  return out;
 }
 
 /** 人类可读的解释（面板与审计都用这一份）。 */
