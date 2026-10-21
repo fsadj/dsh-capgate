@@ -16,6 +16,8 @@ import { collectInstructionTexts, findCitation, citationSupports, isInterrogativ
 import { collectEvidence, instructionOnly, locateSpan, renderContract, validateIntent, effectiveEntries, intentCovers } from './evidence.mjs';
 import { minimizeOptions, describeMinimize } from './minimize.mjs';
 import { verify, summarizeFacts } from './verifier.mjs';
+import { inspectScript } from './scriptaudit.mjs';
+import { existsSync, statSync } from 'node:fs';
 import { parseIntent, extractIntent } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
@@ -47,6 +49,7 @@ export const DEFAULTS = {
   evidenceWindow: 'latest',
   evidenceTurns: 5,
   verifierScope: 'workspace',
+  scriptAudit: 'on',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -78,6 +81,7 @@ export const Config = Schema.object({
   evidenceWindow: Schema.union(['latest', 'session']).default('latest').description('授权证据窗口：只看最后一条指令（默认）或整个会话'),
   evidenceTurns: Schema.number().default(5).description('送给意图抽取的最近对话轮数（只用于消歧，不构成授权）'),
   verifierScope: Schema.union(['workspace', 'any']).default('workspace').description('核查探针的范围：默认只看工作区（软链解析后）'),
+  scriptAudit: Schema.union(['off', 'on']).default('on').description('脚本可读化：静态检查无危险 API 的脚本可按引文放行'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
   ruleAllowTools: Schema.array(String).default([]),
   ruleDenyTools: Schema.array(String).default([]),
@@ -192,7 +196,7 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  function evidenceFor(agent, klass, effect) {
+  function evidenceFor(agent, klass, effect, { allowOpaque = false } = {}) {
     // 只从 instruction 片段里取授权：用户粘贴的日志/网页是数据，不是授权。
     const evidence = collectEvidence(agent, { window: cfg.evidenceWindow });
     const texts = evidence.instructions
@@ -202,7 +206,8 @@ export function apply(ctx, config = {}) {
 
     // 不透明执行（脚本/解释器）里真正发生什么，命令文本看不出来：
     // 用户说"跑一下"并不等于"允许这个脚本做任何事"，所以一律不给引文授权。
-    if (effect.op === 'execute' && effect.opaque) {
+    // 例外：脚本经过静态检查、没有任何危险 API（allowOpaque），此时它等价于"被读过的脚本"。
+    if (effect.op === 'execute' && effect.opaque && !allowOpaque) {
       return { ok: false, why: 'opaque execution: the script decides its own effects' };
     }
 
@@ -455,9 +460,34 @@ export function apply(ctx, config = {}) {
       return guardAsk(exec.agent, askDecision(`capgate: ${label}（批量或通配目标，需人工确认）`, label), label);
     }
 
+    // 1.5c 脚本可读化：不透明的执行，如果脚本本身没有任何危险 API，
+    //      就把它当作"被读过的脚本"，允许引文授权（仍然要有用户原话点名）。
+    let scriptInfo;
+    if (cfg.scriptAudit === 'on' && effect.op === 'execute' && effect.opaque) {
+      const scriptPath = effect.targets
+        .filter((t) => t.kind === 'path')
+        .map((t) => t.value)
+        .find((v) => { try { return existsSync(v) && statSync(v).isFile(); } catch { return false; } });
+      if (scriptPath) {
+        scriptInfo = inspectScript(scriptPath);
+        audit({
+          event: 'script', sid, tool: exec.name, script: scriptPath, kind: scriptInfo.kind,
+          facts: scriptInfo.facts.map((f) => f.type), reason: scriptInfo.reason,
+        });
+        if (scriptInfo.kind === 'ok') console.log(`[capgate] script-read-only ${scriptPath}`);
+      }
+    }
+
     // 1.6 引文核对：对上就直接授予并放行（不经审批面）
-    const evidence = evidenceFor(exec.agent, klass, effect);
+    const evidence = evidenceFor(exec.agent, klass, effect, { allowOpaque: scriptInfo?.kind === 'ok' });
     if (evidence.ok) {
+      if (scriptInfo?.kind === 'ok') {
+        // 脚本可读：只记签名（同一条命令复用时不再问），不授予整个类
+        store.approveSignature(sid, signature);
+        store.bump(sid, 'script');
+        audit({ event: 'allow', by: 'script-read', sid, tool: exec.name, class: klass.key, script: scriptInfo.facts[0]?.target });
+        return next();
+      }
       store.grant(sid, klass.key, { via: 'citation', citation: evidence.primary });
       store.bump(sid, 'grant');
       store.bump(sid, 'citation'); audit({ event: 'grant', by: 'citation', sid, tool: exec.name, class: klass.key, cited: evidence.primary.text });

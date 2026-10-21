@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 会话级状态：已授予的效果类、拒绝计数、待审批调用、审计。
  *
  * 三个刻意的设计选择：
@@ -45,7 +45,7 @@ export class CapgateStore {
     if (!s) {
       s = {
         grants: new Map(), denials: new Map(), pending: new Map(), entities: [],
-        repeats: new Map(), counters: { allow: 0, ask: 0, deny: 0, grant: 0, judge: 0, proof: 0, citation: 0, reuse: 0, rule: 0, verify: 0 },
+        repeats: new Map(), counters: { allow: 0, ask: 0, deny: 0, grant: 0, judge: 0, proof: 0, citation: 0, reuse: 0, rule: 0, verify: 0, script: 0 },
         approvals: new Map(), extents: new Map(),
         createdAt: now(),
       };
