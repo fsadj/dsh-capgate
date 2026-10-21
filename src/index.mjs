@@ -302,6 +302,53 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * 语义解除：把"锁"交给判断方，让它带引文说明"用户确实说了这个范围"。
+   *
+   * 只对**意图类**锁有效（批量/出网/不透明/提权）——这些缺的是"用户想不想"。
+   * sensitive（凭据）与 unknown（效果不可知）缺的是事实，任何引文都补不上，
+   * 所以不走这条路，仍然由前面的分支直接处理。
+   */
+  async function trySemanticClear(exec, { klass, effect, locks, sid, cwd }) {
+    if (cfg.coverageMode !== 'on') return undefined;
+    const CLEARABLE = new Set(['batch', 'egress', 'opaque', 'privilege']);
+    const hard = locks.filter((l) => !CLEARABLE.has(l));
+    if (hard.length > 0) return undefined;          // 有不可解除的锁 → 不做语义解除
+    if (locks.length === 0) return undefined;
+
+    try {
+      const entries = await ensureIntent(exec.agent, sid);
+      if (entries.length === 0) return undefined;
+
+      const targets = effect.targets
+        .filter((t) => t.kind === 'path' || t.kind === 'db' || t.kind === 'host')
+        .map((t) => t.value);
+      if (targets.length === 0) return undefined;
+
+      const ev = collectEvidence(exec.agent, { window: cfg.evidenceWindow, recent: cfg.evidenceRecent });
+      const instructions = ev.instructions.map((m) => instructionOnly(m.text)).filter(Boolean).join('\n').slice(-1500);
+
+      const judged = await judgeCoverage(ctx, exec.agent, {
+        op: klass.op, targets, entries, instructions, locks, cwd, timeoutMs: cfg.judgeTimeoutMs,
+      });
+      if (!judged) return undefined;
+      audit({
+        event: 'coverage', sid, tool: exec.name, class: klass.key, locks,
+        covered: judged.covered.map((c) => `${c.target}#${c.entry}`),
+        uncovered: judged.uncovered, cleared: judged.clear.map((c) => c.lock), all: judged.allCovered,
+      });
+      if (!judged.allCovered) return undefined;
+
+      // 每把锁都必须被解释过，且解释必须附引文
+      const clearedSet = new Set(judged.clear.filter((c) => c.quote).map((c) => c.lock));
+      if (!locks.every((l) => clearedSet.has(l))) return undefined;
+      return judged;
+    } catch (err) {
+      audit({ event: 'coverage_failed', sid, tool: exec.name, reason: String(err && err.message ? err.message : err) });
+      return undefined;
+    }
+  }
+
+  /**
    * 会提问的调查员：把"要问人"变成一份四段式问题。
    * 它只能收紧（verdict=deny）或把问题问得更好，**不能放行**。
    * 任何失败都退回原来的纯文本问题——绝不因为审查失败而卡住或放行。
@@ -519,8 +566,21 @@ export function apply(ctx, config = {}) {
       return next();
     }
 
-    // 1.5 批量/通配：必问
+    // 1.5 批量/通配：先让判断方带引文解释"用户是不是明说了这个范围"。
+    //     解释不了才问人——不再无条件拦。
     if (cardinalityOf(effect) === 'many') {
+      const locksNow = locksOf(klass, effect);
+      const cleared = await trySemanticClear(exec, { klass, effect, locks: locksNow, sid, cwd });
+      if (cleared) {
+        store.approveSignature(sid, stableKey(exec.name, exec.arguments));
+        store.bump(sid, 'reuse');
+        audit({
+          event: 'allow', by: 'semantic-clear', sid, tool: exec.name, class: klass.key,
+          locks: cleared.clear.map((c) => c.lock), quote: cleared.clear.map((c) => c.quote).join(' | ').slice(0, 200),
+        });
+        console.log(`[capgate] semantic-clear ${klass.key} (${cleared.clear.map((c) => c.lock).join(',')})`);
+        return next();
+      }
       store.rememberPending(sid, exec.callId, {
         key: klass.key, label, autoEligible: false, batch: true,
         op: klass.op, targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),

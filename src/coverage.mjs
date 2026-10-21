@@ -14,11 +14,20 @@
  */
 import { callModel } from './intent.mjs';
 
-export function buildCoveragePrompt({ op, targets, entries, instructions }) {
+export function buildCoveragePrompt({ op, targets, entries, instructions, locks = [] }) {
   const list = entries.map((e, i) => `${i}. op=${e.op} target=${e.target || '(unspecified)'} quote=${JSON.stringify(e.quote)}`);
+  const lockBlock = locks.length
+    ? [
+      '',
+      'LOCKED ASPECTS (these block the call unless you clear them):',
+      locks.join(', '),
+      'To clear one, cite the exact user quote that makes the intent unambiguous.',
+      'Do not clear a lock when the user did not address it — a lock you cannot justify stays.',
+    ]
+    : [];
   return [
     'You decide whether a concrete tool call is covered by what the user asked for.',
-    'Return ONLY JSON: {"covered":[{"target":"<one of the call targets>","entry":<entry index>,"why":"<short>"}],"uncovered":["<target>"]}',
+    'Return ONLY JSON: {"covered":[{"target":"<one of the call targets>","entry":<entry index>,"why":"<short>"}],"uncovered":["<target>"],"clear":[{"lock":"<lock>","quote":"<exact user quote>","why":"<short>"}]}',
     '',
     'Rules:',
     '- An entry covers a target only if, reading the quoted user words, a reasonable person would say "yes, that is what I asked for".',
@@ -26,6 +35,9 @@ export function buildCoveragePrompt({ op, targets, entries, instructions }) {
     '- Different naming still counts when it refers to the same thing: "用户表" covers table `users`, "下载目录" covers ~/Downloads.',
     '- If you are not sure, put the target in uncovered. Never guess in the user\'s favour.',
     '- Every target must appear in exactly one of the two lists.',
+    '- If the user stated the scope explicitly (all/every/每个/全部 + the thing), that is enough to clear the "batch" lock.',
+    '- If the user named both the destination and the data, that is enough to clear "egress".',
+    ...lockBlock,
     '',
     'USER INSTRUCTIONS (authorization source):',
     instructions || '(none)',
@@ -56,10 +68,23 @@ export function parseCoverage(text, targets) {
     coveredMap.set(t, { target: t, entry: idx, why: typeof c.why === 'string' ? c.why.slice(0, 60) : '' });
   }
   const all = want.length > 0 && want.every((t) => coveredMap.has(t));
+
+  const clear = [];
+  for (const c of Array.isArray(obj.clear) ? obj.clear : []) {
+    const lock = typeof c?.lock === 'string' ? c.lock.trim() : '';
+    if (!lock) continue;
+    clear.push({
+      lock,
+      quote: typeof c.quote === 'string' ? c.quote.trim().slice(0, 200) : '',
+      why: typeof c.why === 'string' ? c.why.slice(0, 60) : '',
+    });
+  }
+
   return {
     covered: [...coveredMap.values()],
     uncovered: want.filter((t) => !coveredMap.has(t)),
     allCovered: all,
+    clear,
   };
 }
 
