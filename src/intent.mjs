@@ -55,24 +55,28 @@ export async function compileEffects(ctx, agent, call, { timeoutMs = 8000 } = {}
 
   let header;
   try { header = agent?.session?.requestHeader?.(); } catch { return undefined; }
-  if (!header) return undefined;
+  const provider = header?.config?.provider;
+  const model = header?.config?.model;
+  if (!provider || !model) return undefined;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), Math.max(500, Number(timeoutMs) || 8000));
   let text = '';
   try {
     const stream = llm.stream({
-      ...header,
-      messages: [{ role: 'user', content: [{ type: 'text', text: buildCompilePrompt(call) }] }],
+      provider,
+      model,
       system: 'You compile shell commands into literal effects. Output JSON only.',
-      tools: [],
+      messages: [{ role: 'user', content: [{ type: 'text', text: buildCompilePrompt(call) }] }],
+      temperature: 0,
       signal: controller.signal,
     });
     for await (const chunk of stream) {
       if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') text += chunk.text;
       if (chunk?.type === 'finish') break;
     }
-  } catch {
+  } catch (err) {
+    console.warn('[capgate] compile failed:', err && err.message ? err.message : err);
     return undefined;
   } finally {
     clearTimeout(timer);

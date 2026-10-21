@@ -10,6 +10,19 @@ import { appendFileSync } from 'node:fs';
 
 const now = () => Date.now();
 
+/** 已确认范围与目标的匹配：支持 `*` `?` 通配，其余按前缀/精确比。 */
+function matchPattern(pattern, value) {
+  const p = String(pattern).replace(/\\/g, '/');
+  const v = String(value).replace(/\\/g, '/');
+  if (p === v) return true;
+  if (/[*?]/.test(p)) {
+    const re = new RegExp('^' + p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
+    return re.test(v);
+  }
+  // 目录前缀：`Downloads/` 覆盖 `Downloads/a.zip`
+  return v.startsWith(p.endsWith('/') ? p : `${p}/`);
+}
+
 /** 简单的秘密脱敏：审计里不出现密钥/令牌。 */
 export function redact(value, maxLen = 300) {
   const s = typeof value === 'string' ? value : JSON.stringify(value ?? null);
@@ -33,7 +46,7 @@ export class CapgateStore {
       s = {
         grants: new Map(), denials: new Map(), pending: new Map(), entities: [],
         repeats: new Map(), counters: { allow: 0, ask: 0, deny: 0, grant: 0, judge: 0 },
-        approvals: new Map(),
+        approvals: new Map(), extents: new Map(),
         createdAt: now(),
       };
       this.sessions.set(id, s);
@@ -103,6 +116,32 @@ export class CapgateStore {
 
   dropSignature(sessionId, signature) {
     this.session(sessionId).approvals.delete(signature);
+  }
+
+  /**
+   * 人批准过的「目标范围」：以后落在这个范围内的同类操作不再问。
+   *
+   * 这是"意图确认"的落地形态：人批准的是**集合**（几条路径 / 一个通配），
+   * 之后只要新调用的目标都是这个集合的子集、且 op 相同，就算已被授权。
+   * 集合来自人，不来自模型——这是它和"让模型放行"的本质区别。
+   */
+  addExtent(sessionId, op, targets) {
+    const s = this.session(sessionId);
+    const list = s.extents.get(op) ?? [];
+    for (const t of targets ?? []) {
+      const value = String(t ?? '').trim();
+      if (value) list.push({ value, at: now() });
+    }
+    s.extents.set(op, list.slice(-64));
+  }
+
+  /** 新调用的目标是否全部落在已确认的范围内（子集判定）。 */
+  coveredByExtent(sessionId, op, targets) {
+    const list = this.session(sessionId).extents.get(op) ?? [];
+    const live = list.filter((e) => now() - e.at <= this.grantTtlMs);
+    if (live.length === 0) return false;
+    if (!Array.isArray(targets) || targets.length === 0) return false;
+    return targets.every((t) => live.some((e) => matchPattern(e.value, String(t))));
   }
 
   setEntities(sessionId, entities) {

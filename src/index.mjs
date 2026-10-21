@@ -1,4 +1,4 @@
-﻿/**
+/**
  * capgate —— 效果类摊销授权（effect-class amortized authorization）。
  *
  * 判定链：
@@ -79,8 +79,10 @@ function readMode(value) {
   return value;
 }
 
-/** 把 arguments 变成稳定字符串：同样一条命令每次得到同样的签名。 */
-function stableKey(value) {
+/** 命令文本里出现任何"变更/外发"迹象（编译结果的独立第二意见）。 */
+const MUTATION_HINT = /(remove-item|\brm\b|\bdel\b|erase\b|rmdir|\brd\b|set-content|add-content|out-file|new-item|move-item|copy-item|\bmv\b|\bcp\b|robocopy|curl|wget|invoke-restmethod|invoke-webrequest|scp|sftp|upload|\bpost\b|\bput\b)/i;
+
+/** 把 arguments 变成稳定字符串：同样一条命令每次得到同样的签名。 */function stableKey(value) {
   const seen = new WeakSet();
   const walk = (v) => {
     if (v === null || typeof v !== 'object') return v;
@@ -344,6 +346,17 @@ export function apply(ctx, config = {}) {
       return next();
     }
 
+    // 1.2c 落在"人批准过的目标范围"里 → 放行。
+    //      范围是人在批准那一刻给出的集合，模型无法扩张它；判定是纯集合包含。
+    if (klass.op === 'delete' || klass.op === 'write') {
+      const pathTargets = effect.targets.filter((t) => t.kind === 'path').map((t) => t.value);
+      if (store.coveredByExtent(sid, klass.op, pathTargets)) {
+        store.bump(sid, 'allow');
+        audit({ event: 'allow', by: 'extent', sid, tool: exec.name, class: klass.key, targets: pathTargets.slice(0, 5) });
+        return next();
+      }
+    }
+
     // 1.2b 已硬化的放行规则（必须经人显式确认；敏感路径已在上面被拦下）
     if (hasRule(learned, klass.key, 'allow')) {
       store.bump(sid, 'allow');
@@ -374,7 +387,10 @@ export function apply(ctx, config = {}) {
 
     // 1.5 批量/通配：必问
     if (cardinalityOf(effect) === 'many') {
-      store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false, batch: true });
+      store.rememberPending(sid, exec.callId, {
+        key: klass.key, label, autoEligible: false, batch: true,
+        op: klass.op, targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
+      });
       store.bump(sid, 'ask');
       audit({ event: 'ask', sid, tool: exec.name, class: klass.key, autoEligible: false, why: 'batch' });
       return guardAsk(exec.agent, askDecision(`capgate: ${label}（批量或通配目标，需人工确认）`, label), label);
@@ -414,6 +430,7 @@ export function apply(ctx, config = {}) {
         { timeoutMs: cfg.judgeTimeoutMs },
       );
       if (compiled) {
+        console.log(`[capgate] compiled ${exec.name} -> ${compiled.ops.map((o) => o.op).join('+')}${compiled.residual ? ' (residual)' : ''}`);
         const asEffect = (op, targets) => ({
           op,
           targets: targets.map((t) => (/^[a-z0-9.-]+\.[a-z]{2,}(\/|$)/i.test(t) || /^https?:\/\//i.test(t)
@@ -441,7 +458,10 @@ export function apply(ctx, config = {}) {
         const allRead = compiled.ops.every((o) => o.op === 'read');
         const allInside = compiled.ops.every((o) =>
           asEffect(o.op, o.targets).targets.every((t) => classify(asEffect(o.op, o.targets), { root: cwd }).scope === 'workspace'));
-        if (allRead && allInside && !compiled.residual && cfg.judgeAutoAllow) {
+        // 两路独立意见取更严：编译说"纯读"，但如果命令文本里出现任何变更迹象，
+        // 就当成冲突 → 问人。这样即使模型编译撒谎，也只能骗到"两边都说无害"的情况。
+        const textHint = MUTATION_HINT.test(String(effect.raw ?? ''));
+        if (allRead && allInside && !compiled.residual && !textHint && cfg.judgeAutoAllow) {
           store.bump(sid, 'allow');
           audit({ event: 'allow', by: 'compiled-read', sid, tool: exec.name, class: klass.key });
           return next();
@@ -451,7 +471,13 @@ export function apply(ctx, config = {}) {
         const summary = compiled.ops.map((o) => `${o.op}(${o.targets.slice(0, 2).join(',') || '?'})`).join(' / ');
         const eff = asEffect(compiled.ops[0].op, compiled.ops[0].targets);
         store.rememberPending(sid, exec.callId, {
-          key: classify(eff, { root: cwd }).key, label, autoEligible: false, op: 'other', opaque: false,
+          key: classify(eff, { root: cwd }).key,
+          label,
+          autoEligible: false,
+          op: compiled.ops[0].op,
+          opaque: false,
+          // 人批准后把"这批目标"记成范围，后续同类子集不再问
+          targets: compiled.ops.flatMap((o) => o.targets),
         });
         store.bump(sid, 'ask');
         audit({ event: 'ask', sid, tool: exec.name, class: klass.key, compiled: summary, residual: compiled.residual });
@@ -626,6 +652,11 @@ export function apply(ctx, config = {}) {
       }
       // 只记住"这一条命令"，不推广到同类；下次同一条命令直接放行
       if (sig) store.approveSignature(sid, sig);
+      // 人批准的是"这批目标" → 记成范围，同类子集以后不再问
+      if (pending.op && Array.isArray(pending.targets) && pending.targets.length > 0) {
+        store.addExtent(sid, pending.op, pending.targets);
+        audit({ event: 'extent', by: 'human', sid, tool: req.toolName, class: pending.key, targets: pending.targets.slice(0, 5) });
+      }
     } else {
       store.deny(sid, pending.key);
       audit({ event: 'deny', by: 'human', outcome, sid, tool: req.toolName, class: pending.key });

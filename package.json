@@ -27,7 +27,7 @@
   },
   "scripts": {
     "setup": "node scripts/setup.mjs",
-    "test": "node --test test/classify.test.mjs test/citations.test.mjs test/flow.test.mjs test/rules.test.mjs test/parity.test.mjs test/escalation.test.mjs test/learn.test.mjs test/schema.test.mjs test/intent.test.mjs",
+    "test": "node --test test/classify.test.mjs test/citations.test.mjs test/flow.test.mjs test/rules.test.mjs test/parity.test.mjs test/escalation.test.mjs test/learn.test.mjs test/schema.test.mjs test/intent.test.mjs test/extent.test.mjs",
     "bench": "node bench/heldout.mjs",
     "demo": "node scripts/demo.mjs",
     "e2e": "node scripts/e2e.mjs"
