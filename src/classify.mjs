@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 效果抽取与效果类判定（纯函数，无 DSH 依赖，可单测）。
  *
  * 设计要点：判定单元是"效果类"而不是"工具名"、也不是"计划"。
@@ -173,6 +173,19 @@ export function parseShell(command, cwd, depth = 0) {
 
   const op = plainQuery || provenRead ? 'read' : (rawOp === 'read' ? 'other' : rawOp);
 
+  // SQL：`psql -c "select ..."` / `mysql -e "update ..."` 这类命令，
+  // 词法层看不出效果，但语句本身是可解析的——直接按语句归类，不必交给 LLM。
+  if (op === 'other') {
+    const sq = sqlEffect(text);
+    if (sq) {
+      return {
+        op: sq.op,
+        targets: (sq.tables.length ? sq.tables : ['(unknown)']).map((v) => ({ kind: 'db', value: `db:${v}` })),
+        wildcard: false, source: 'sql', raw: sq.statement, sql: sq,
+      };
+    }
+  }
+
   // 不透明执行：跑解释器/脚本时，真实效果（可能联网、写盘、删东西）藏在脚本里，
   // 命令文本看不出来。这类一律当作"未知效果"，不允许模型复核直接放行。
   const opaque = !plainQuery && op === 'execute' && verbs.some((v) => CMD_SETS.interpreter.has(v));
@@ -315,6 +328,8 @@ export function effectOfSchema(definition, args, cwd) {
 }
 
 /** 工具调用 → 效果。未知工具按 `other` 处理（→ 一定问人）。 */
+import { sqlFromArgs, sqlEffect } from './sql.mjs';
+
 export function effectOf(tool, args, cwd) {
   const a = args && typeof args === 'object' ? args : {};
   const pickPath = () => {
@@ -336,6 +351,15 @@ export function effectOf(tool, args, cwd) {
   }
   if (['delete', 'remove', 'rm', 'unlink'].includes(tool)) {
     return { op: 'delete', targets: [{ kind: 'path', value: normalizePath(pickPath() ?? '.', cwd) }], wildcard: /[*?]/.test(pickPath() ?? ''), source: 'tool', raw: tool };
+  }
+  // 数据库工具：先看参数里是不是 SQL，认得出来就按 SQL 的效果归类。
+  const sq = sqlFromArgs(a);
+  if (sq) {
+    return {
+      op: sq.op,
+      targets: (sq.tables.length ? sq.tables : ['(unknown)']).map((v) => ({ kind: 'db', value: 'db:' + v })),
+      wildcard: false, source: 'sql', raw: sq.statement, sql: sq,
+    };
   }
   return { op: 'other', targets: [{ kind: 'path', value: normalizePath(pickPath() ?? '.', cwd) }], wildcard: false, source: 'tool', raw: tool };
 }
@@ -440,6 +464,8 @@ export function locksOf(klass, effect) {
   if (cardinalityOf(effect) === 'many') out.push('batch');
   if (klass.op === 'send') out.push('egress');
   if (effect.opaque) out.push('opaque');
+  // 无 WHERE 的 DELETE / DROP / TRUNCATE：等于一次批量删除，必须问人。
+  if (effect.sql?.destructive) out.push('batch');
   if (effect.elevated) out.push('privilege');
   if (klass.op === 'other') out.push('unknown');
   return out;
