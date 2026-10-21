@@ -187,6 +187,9 @@ export function parseShell(command, cwd, depth = 0) {
     for (let i = 0; i < tokens.length; i += 1) {
       const t = tokens[i].replace(/^["']|["']$/g, '').replace(/^@/, '');
       if (!t || t.startsWith('-') || /^https?:/i.test(t)) continue;
+      // Windows 命令行开关用 `/`：`whoami /groups` 里的 /groups 不是路径。
+      // （真机采样时这几个开关被当成 `C:/groups`，把只读命令判成了"项目外"）
+      if (process.platform === 'win32' && /^\/[A-Za-z?]{1,12}$/.test(t)) continue;
       // `$var` 是运行时才知道的值，不是字面路径；但 `$env:`/`$HOME` 是真实路径
       if (/^\$(?!env:|HOME|USERPROFILE\b)/i.test(t)) continue;
       const fw = firstWord(t);

@@ -1,4 +1,4 @@
-﻿import { test } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseShell, effectOf, effectOfSchema, classify, describeClass, cardinalityOf } from '../src/classify.mjs';
 
@@ -162,4 +162,12 @@ test('用工具 schema 推效果（MCP/第三方工具）', () => {
 test('schema 推不出效果时返回 undefined（回退到启发式/问人）', () => {
   const unknown = effectOfSchema({ name: 'mcp__misc__do', description: '', parameters: {} }, { foo: 1 }, ROOT);
   assert.equal(unknown, undefined);
+});
+
+test('Windows 的 /开关 不是路径（真机采样发现的）', () => {
+  if (process.platform !== 'win32') return;
+  for (const cmd of ['whoami /groups', 'driverquery /FO CSV', 'ipconfig /all']) {
+    const c = classify(parseShell(cmd, ROOT), { root: ROOT });
+    assert.equal(c.scope, 'workspace', `${cmd} 里的 /开关 被当成了 C:/… 路径`);
+  }
 });
