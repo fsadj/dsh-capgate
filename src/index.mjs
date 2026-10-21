@@ -13,6 +13,8 @@
 import Schema from '@deepseek-ai/schemastery';
 import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf, normalizePath, locksOf } from './classify.mjs';
 import { collectInstructionTexts, findCitation, citationSupports, isInterrogative, extractEntities } from './citations.mjs';
+import { collectEvidence, instructionOnly, locateSpan, renderContract } from './evidence.mjs';
+import { minimizeOptions, describeMinimize } from './minimize.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
 import { loadState, saveState, observe, candidates, addRule, removeRule, hasRule } from './learn.mjs';
@@ -177,7 +179,11 @@ export function apply(ctx, config = {}) {
   }
 
   function evidenceFor(agent, klass, effect) {
-    const texts = collectInstructionTexts(agent);
+    // 只从 instruction 片段里取授权：用户粘贴的日志/网页是数据，不是授权。
+    const evidence = collectEvidence(agent);
+    const texts = evidence.instructions
+      .map((m) => ({ text: instructionOnly(m.text), seq: m.seq, msgId: m.msgId }))
+      .filter((t) => t.text.length > 0);
     if (texts.length === 0) return { ok: false, why: 'no instruction text in session' };
 
     // 不透明执行（脚本/解释器）里真正发生什么，命令文本看不出来：
@@ -321,7 +327,16 @@ export function apply(ctx, config = {}) {
           store.rememberPending(sid, exec.callId, { key: klass.key, label, sensitive: true, autoEligible: false });
           return guardAsk(exec.agent, askDecision(`capgate: ${label} 已连续拒绝 ${n} 次，转人工核对`, label), label);
         }
-        return { kind: 'deny', reason: 'capgate: 拒绝（敏感路径在项目外）。义务: 说明为什么需要它，或改在项目内完成；凭据类文件不允许读取' };
+        const sensOpts = minimizeOptions({
+          op: klass.op,
+          targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
+        });
+        return {
+          kind: 'deny',
+          reason: `capgate: 拒绝（敏感路径在项目外）。凭据类文件不允许读取。`
+            + (sensOpts.length ? `\n${describeMinimize(sensOpts)}` : ''),
+          alternatives: sensOpts.map((o) => o.label),
+        };
       }
       const sensEvidence = evidenceFor(exec.agent, klass, effect);
       store.rememberPending(sid, exec.callId, {
@@ -414,12 +429,21 @@ export function apply(ctx, config = {}) {
       const repeats = store.repeat(sid, identity);
       const n = store.deny(sid, klass.key);
       store.bump(sid, 'deny');
-      audit({ event: 'deny', reason: 'outside-no-citation', sid, tool: exec.name, class: klass.key, why: evidence.why, count: n, repeats });
+      const outOpts = minimizeOptions({
+        op: klass.op,
+        targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
+      });
+      audit({ event: 'deny', reason: 'outside-no-citation', sid, tool: exec.name, class: klass.key, why: evidence.why, count: n, repeats, alternatives: outOpts.map((o) => o.label) });
       if (n >= cfg.maxConsecutiveDenials || repeats > cfg.maxRepeats) {
         store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false });
         return guardAsk(exec.agent, askDecision(`capgate: ${label} 已反复被拒（${Math.max(n, repeats)} 次），转人工核对`, label), label);
       }
-      return { kind: 'deny', reason: 'capgate: 拒绝（目标在项目外，且用户原话没有提到它）。义务: 改在项目内完成，或请用户明确指定该目标' };
+      return {
+        kind: 'deny',
+        reason: 'capgate: 拒绝（目标在项目外，且用户原话没有提到它）。'
+          + (outOpts.length ? `\n${describeMinimize(outOpts)}` : '义务: 改在项目内完成，或请用户明确指定该目标'),
+        alternatives: outOpts.map((o) => o.label),
+      };
     }
 
     // 1.7b "看不懂的调用"交给效果编译器：模型只负责**翻译**成字面效果，
@@ -741,6 +765,15 @@ export function apply(ctx, config = {}) {
             `denyPaths: ${rules.denyPaths.join(', ') || '(none)'}`,
           ];
           return { kind: 'success', text: `capgate 规则\n${lines.join('\n')}` };
+        }
+        if (arg === 'contract') {
+          const ev = collectEvidence(invocation.agent);
+          const s2 = store.session(sid);
+          const labels = [...s2.grants.keys()].slice(-10).map((k) => ({
+            verdict: 'allow', op: String(k).split('|')[0], target: k,
+          }));
+          ev.labels = labels;
+          return { kind: 'success', text: renderContract(ev, []) };
         }
         if (arg === 'learn') {
           const list = candidates(learned, { approveAt: cfg.hardenAfter, rejectAt: cfg.rejectAfter });
