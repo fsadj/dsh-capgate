@@ -6,7 +6,12 @@
  *   - 可以直接对账"读的是不是它现在要跑的那个文件"；
  *   - 省一次磁盘读，也避免"我们看到的内容"和"agent 看到的内容"不一致。
  */
+import { createHash } from 'node:crypto';
 import { normalizePath } from './classify.mjs';
+
+export function hashText(text) {
+  return createHash('sha256').update(String(text ?? ''), 'utf8').digest('hex');
+}
 
 function textOf(content) {
   return (content ?? [])
@@ -51,7 +56,7 @@ export function findReadContent(agent, scriptPath, { cwd = '' } = {}) {
       if (!samePath(target, scriptPath, cwd)) continue;
       const content = textOf(ev.data?.content);
       if (!content) continue;
-      hit = { content, callId: String(ev.data?.callId ?? ''), path: String(target) };
+      hit = { content, hash: hashText(content), callId: String(ev.data?.callId ?? ''), path: String(target) };
     }
     return hit;
   } catch {

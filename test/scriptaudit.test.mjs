@@ -69,3 +69,11 @@ test('既读又写 → 仍然否决', () => withTmp((dir) => {
   writeFileSync(f, "import { readFileSync, writeFileSync } from 'node:fs'\nwriteFileSync('o', readFileSync('i'))\n");
   assert.equal(inspectScript(f).kind, 'risky');
 }));
+
+test('非 JS/TS 脚本 → 不分析，保持不透明', () => withTmp((dir) => {
+  const f = join(dir, 'build.sh');
+  writeFileSync(f, 'rm -rf build\n');
+  const r = inspectScript(f);
+  assert.equal(r.kind, 'risky');
+  assert.ok(r.facts.some((x) => x.type === 'script.unsupported_language'));
+}));

@@ -15,6 +15,9 @@ import { readFileSync, statSync, existsSync } from 'node:fs';
 
 export const DEFAULT_MAX_BYTES = 64 * 1024;
 
+/** 静态检查只覆盖我们真正看得懂的语言；其它一律不可分析（保持不透明）。 */
+const ANALYZABLE = /\.(mjs|cjs|jsx?|tsx?)$/i;
+
 /**
  * 严重 API：命中任意一条 → **否决**（即使被用户点名也问人）。
  * 这些是"脚本自己决定后果"的特征：起子进程、写/删盘、出网、动态执行。
@@ -64,6 +67,10 @@ export function inspectScript(target, { maxBytes = DEFAULT_MAX_BYTES, content } 
         return { kind: 'risky', facts: [{ type: 'script.too_large', target, value: st.size }], reason: '脚本过大，不做静态检查' };
       }
       size = st.size;
+    }
+    // 语言闸门：只分析我们看得懂的脚本，其它一律保持"不透明"。
+    if (!ANALYZABLE.test(String(target ?? ''))) {
+      return { kind: 'risky', facts: [{ type: 'script.unsupported_language', target }], reason: '静态检查只覆盖 JS/TS 脚本，其它语言按不透明处理' };
     }
     const text = fromSession ? content : readFileSync(target, 'utf8');
     facts.push({ type: 'script.source', target, value: fromSession ? 'session-read' : 'fs' });

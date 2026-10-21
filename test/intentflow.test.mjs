@@ -135,3 +135,13 @@ test('显式配置 window=session 时才看整个会话', async () => {
   const d = await call('pwsh', { command: `Remove-Item '${HOME}/Downloads/a.zip' -Force` });
   assert.equal(d.kind, 'allow', 'window=session 时应保留原行为');
 });
+
+test('window=recent：多轮追问能生效（最后 3 条内）', async () => {
+  const call = harnessWithHistory([
+    `把 ${HOME}/Downloads/a.zip 删掉`,
+    '好',
+    '顺便把 b.zip 也删掉',
+  ], { evidenceWindow: 'recent', evidenceRecent: 3 });
+  const d = await call('pwsh', { command: `Remove-Item '${HOME}/Downloads/a.zip' -Force` });
+  assert.equal(d.kind, 'allow', 'recent 窗口内第一条指令仍算授权');
+});

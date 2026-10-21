@@ -53,7 +53,7 @@ export function instructionOnly(text) {
  * 回复（assistant）只用来**消除指代**，永远不能当授权：
  * 授权条目的 quote 只能在 user 的 instruction span 里定位。
  */
-export function collectEvidence(agent, { labels = [], taskId = '', window = 'latest', turns = 5 } = {}) {
+export function collectEvidence(agent, { labels = [], taskId = '', window = 'recent', recent = 3, turns = 5 } = {}) {
   const sessionId = String(agent?.session?.id ?? 'anonymous');
   const out = { taskId: taskId || sessionId, instructions: [], labels: [], turns: [] };
   const pendingTurns = [];
@@ -100,10 +100,13 @@ export function collectEvidence(agent, { labels = [], taskId = '', window = 'lat
   }
 
   out.turns = pendingTurns.filter((t) => t.user || t.assistant).slice(-Math.max(1, Number(turns) || 5));
-  // 任务边界：默认只看最后一条用户指令。
-  // 不加这条，上一个任务的授权会漏到下一个任务里（真机上已经发生过一次）。
+  // 任务边界：默认只看最近 N 条用户指令。
+  // 只看最后一条会让"把那个也删了"这类追问失去依据；看整个会话又会把上一个任务带进来。
   if (window === 'latest' && out.instructions.length > 1) {
     out.instructions = out.instructions.slice(-1);
+  } else if (window === 'recent') {
+    const n = Math.max(1, Number(recent) || 3);
+    if (out.instructions.length > n) out.instructions = out.instructions.slice(-n);
   }
   out.labels = labels.slice(-200);
   return out;

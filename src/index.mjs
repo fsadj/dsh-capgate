@@ -17,8 +17,8 @@ import { collectEvidence, instructionOnly, locateSpan, renderContract, validateI
 import { minimizeOptions, describeMinimize } from './minimize.mjs';
 import { verify, summarizeFacts } from './verifier.mjs';
 import { inspectScript } from './scriptaudit.mjs';
-import { findReadContent } from './readlog.mjs';
-import { existsSync, statSync } from 'node:fs';
+import { findReadContent, hashText } from './readlog.mjs';
+import { existsSync, statSync, readFileSync } from 'node:fs';
 import { parseIntent, extractIntent } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
@@ -48,6 +48,7 @@ export const DEFAULTS = {
   verifyMode: 'on',
   intentMode: 'on',
   evidenceWindow: 'latest',
+  evidenceRecent: 3,
   evidenceTurns: 5,
   verifierScope: 'workspace',
   scriptAudit: 'on',
@@ -79,7 +80,7 @@ export const Config = Schema.object({
   judgeTimeoutMs: Schema.number().default(8000).description('复核超时；超时转人工'),
   verifyMode: Schema.union(['off', 'on']).default('on').description('独立核查：只读探针，只回事实'),
   intentMode: Schema.union(['off', 'on']).default('on').description('语义引文：从原话抽取契约条目'),
-  evidenceWindow: Schema.union(['latest', 'session']).default('latest').description('授权证据窗口：只看最后一条指令（默认）或整个会话'),
+  evidenceWindow: Schema.union(['latest', 'recent', 'session']).default('latest').description('授权证据窗口：只看最后一条指令（默认）或整个会话'),
   evidenceTurns: Schema.number().default(5).description('送给意图抽取的最近对话轮数（只用于消歧，不构成授权）'),
   verifierScope: Schema.union(['workspace', 'any']).default('workspace').description('核查探针的范围：默认只看工作区（软链解析后）'),
   scriptAudit: Schema.union(['off', 'on']).default('on').description('脚本可读化：静态检查无危险 API 的脚本可按引文放行'),
@@ -199,7 +200,7 @@ export function apply(ctx, config = {}) {
 
   function evidenceFor(agent, klass, effect, { allowOpaque = false } = {}) {
     // 只从 instruction 片段里取授权：用户粘贴的日志/网页是数据，不是授权。
-    const evidence = collectEvidence(agent, { window: cfg.evidenceWindow });
+    const evidence = collectEvidence(agent, { window: cfg.evidenceWindow, recent: cfg.evidenceRecent });
     const texts = evidence.instructions
       .map((m) => ({ text: instructionOnly(m.text), seq: m.seq, msgId: m.msgId }))
       .filter((t) => t.text.length > 0);
@@ -269,7 +270,7 @@ export function apply(ctx, config = {}) {
   const intentCache = new Map();
 
   async function ensureIntent(agent, sid) {
-    const ev = collectEvidence(agent, { taskId: cfg.taskId, window: cfg.evidenceWindow, turns: cfg.evidenceTurns });
+    const ev = collectEvidence(agent, { taskId: cfg.taskId, window: cfg.evidenceWindow, recent: cfg.evidenceRecent, turns: cfg.evidenceTurns });
     const corpus = ev.instructions.map((m) => instructionOnly(m.text)).filter(Boolean).join('\n');
     if (!corpus.trim()) return [];
     const hash = `${corpus.length}:${corpus.slice(0, 60)}:${corpus.slice(-60)}`;
@@ -470,15 +471,28 @@ export function apply(ctx, config = {}) {
         .map((t) => t.value)
         .find((v) => { try { return existsSync(v) && statSync(v).isFile(); } catch { return false; } });
       if (scriptPath) {
-        // 先用 agent 自己读过的那份内容（可审计、可对账），没有再自己读盘
+        // 先用 agent 自己读过的那份内容（可审计、可对账），没有再自己读盘。
+        // 对账：读时 hash 与执行时 hash 不一致 → 内容在两次之间变过 → 不采信那份内容。
         const seen = findReadContent(exec.agent, scriptPath, { cwd });
-        scriptInfo = inspectScript(scriptPath, seen ? { content: seen.content } : {});
+        let stale = false;
+        if (seen) {
+          try {
+            const current = readFileSync(scriptPath, 'utf8');
+            stale = hashText(current) !== hashText(seen.content);
+          } catch {
+            stale = true;
+          }
+        }
+        scriptInfo = stale
+          ? { kind: 'risky', facts: [{ type: 'script.stale', target: scriptPath, value: seen?.hash }], reason: '脚本在 agent 读完后被修改过' }
+          : inspectScript(scriptPath, seen ? { content: seen.content } : {});
         audit({
           event: 'script', sid, tool: exec.name, script: scriptPath, kind: scriptInfo.kind,
-          source: seen ? 'session-read' : 'fs', readCallId: seen?.callId,
+          source: seen ? 'session-read' : 'fs', readCallId: seen?.callId, stale,
           facts: scriptInfo.facts.map((f) => f.type), reason: scriptInfo.reason,
         });
-        if (scriptInfo.kind === 'ok') console.log(`[capgate] script-read-only ${scriptPath} (${seen ? 'session' : 'fs'})`);
+        if (scriptInfo.kind === 'ok') console.log(`[capgate] script-ok ${scriptPath} (${seen ? 'session' : 'fs'})`);
+        if (stale) console.log(`[capgate] script-stale ${scriptPath}`);
       }
     }
 
