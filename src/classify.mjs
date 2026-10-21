@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 效果抽取与效果类判定（纯函数，无 DSH 依赖，可单测）。
  *
  * 设计要点：判定单元是"效果类"而不是"工具名"、也不是"计划"。
@@ -59,6 +59,8 @@ const SEGMENT_SPLIT = /[;|&\n\r]+/;
 const BLOCK_SPLIT = /[{}()]+/;
 
 const SHELL_WRAP = /\b(?:bash|sh|pwsh|powershell|cmd)(?:\.exe)?\s+(?:-c|-command|\/c)\s+(["'])([\s\S]*)\1/i;
+
+import { existsSync, realpathSync } from 'node:fs';
 
 /** 归一化路径为 `C:/a/b` 形式（不做真实文件系统解析）。 */
 export function normalizePath(p, cwd = 'C:/') {
@@ -376,7 +378,15 @@ export function classify(effect, scope) {
   }
 
   let scopeName;
-  if (paths.every((p) => inside(p, root))) scopeName = 'workspace';
+  // 符号链接逃逸：工作区里一个软链指向外面时，按字面路径会判成"项目内"，
+  // 实际写的却是工作区外。已存在的目标先解析 realpath 再比。
+  const realOf = (p) => {
+    try { return existsSync(p) ? realpathSync(p) : p; } catch { return p; }
+  };
+  const escapes = paths.some((p) => inside(p, root) && !inside(realOf(p), root));
+
+  if (escapes) scopeName = 'outside:symlink';
+  else if (paths.every((p) => inside(p, root))) scopeName = 'workspace';
   else if (named.length > 0 && paths.every((p) => named.some((n) => inside(p, n)))) scopeName = 'named:' + bucketOf(named[0]);
   else scopeName = 'outside:' + bucketOf(paths[0] ?? '');
 
