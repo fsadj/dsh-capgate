@@ -135,3 +135,17 @@ test('影响面小、可逆、无凭据、一致 → 放行', async () => {
   const d = await combo('把 repo 里所有 zip 都删掉', ENTRIES, CLEAR_OK);
   assert.equal(d.kind, 'allow');
 });
+
+test('审查 agent 直接说 allow（即使没给 clear）→ 放行', async () => {
+  const d = await combo('把 repo 里所有 zip 都删掉', ENTRIES, {
+    ...CLEAR_OK, verdict: 'allow', clear: [],
+  });
+  assert.equal(d.kind, 'allow');
+});
+
+test('说 allow 但数据是凭据 → 不放行', async () => {
+  const d = await combo('把 repo 里所有 zip 都删掉', ENTRIES, {
+    ...CLEAR_OK, verdict: 'allow', clear: [], dataClass: 'credential',
+  });
+  assert.equal(d.kind, 'ask');
+});

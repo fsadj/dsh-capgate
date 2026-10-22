@@ -14,7 +14,7 @@
  */
 
 /** 审查结果的结构化契约（默认不给 allow：放行只能由策略决定） */
-export const REVIEW_SCHEMA = makeReviewSchema(false);
+export const REVIEW_SCHEMA = makeReviewSchema(true);
 
 /** @param {boolean} allow 仅用于评测：允许 agent 直接说 allow */
 export function makeReviewSchema(allow = false) {
@@ -25,7 +25,19 @@ export function makeReviewSchema(allow = false) {
       action: { type: 'string' },
       facts: { type: 'array', items: { type: 'string' } },
       suggestion: { type: 'string' },
-      alternatives: { type: 'array', items: { type: 'string' } },
+      alternatives: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            label: { type: 'string' },
+            op: { type: 'string' },
+            scope: { type: 'string' },
+          },
+          required: ['label'],
+          additionalProperties: false,
+        },
+      },
       covered: { type: 'array', items: { type: 'string' } },
       uncovered: { type: 'array', items: { type: 'string' } },
       clear: {
@@ -79,9 +91,10 @@ export function buildReviewPrompt(input, { allow = false } = {}) {
     '- If you cannot ground a target in the user words, put it in uncovered.',
     allow
       ? '- You may say allow / ask / deny. Say allow only when the user words clearly cover this exact call.'
-      : '- You may recommend deny or ask. You may NOT recommend allow — the policy decides that from your facts.',
+      : '- Say allow when the user words clearly cover this call. Say deny when they clearly do not, or when a hard rule is broken. Say ask when you are unsure or when a human should decide.',
     '- To clear a lock you must quote the user words that make the intent unambiguous.',
     '- When unsure, prefer ask and say exactly what is missing.',
+    '- Put a strictly narrower alternative in alternatives when the call is too broad (less data, fewer files, or a dry run).',
     '',
     'TOOL: ' + input.tool,
     'EFFECT: ' + input.op + ' -> ' + (input.targets ?? []).join(', '),
@@ -121,7 +134,11 @@ function normalize(obj, allow = false) {
     action: typeof obj.action === 'string' ? obj.action.slice(0, 80) : '',
     facts: arr(obj.facts),
     suggestion: typeof obj.suggestion === 'string' ? obj.suggestion.slice(0, 80) : '',
-    alternatives: arr(obj.alternatives),
+    alternatives: (Array.isArray(obj.alternatives) ? obj.alternatives : []).map((a) => {
+      if (typeof a === 'string') return { label: a };
+      if (a && typeof a === 'object' && typeof a.label === 'string') return { label: a.label.slice(0, 80), op: a.op, scope: a.scope };
+      return undefined;
+    }).filter(Boolean).slice(0, 3),
     covered: arr(obj.covered),
     uncovered: arr(obj.uncovered),
     clear: (Array.isArray(obj.clear) ? obj.clear : []).map((c) => {
@@ -158,7 +175,7 @@ export function clearReviewCache() { reviewCache.clear(); }
 export async function reviewWithAgent(ctx, agent, input, {
   provider,
   tools = REVIEW_TOOLS,
-  allow = false,
+  allow = true,
   timeoutMs = 30000,
   retries = 1,
 } = {}) {

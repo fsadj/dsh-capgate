@@ -16,7 +16,7 @@ const input = {
 test('审查提示词：明确"只读、不能放行、引文才能解除锁"', () => {
   const p = buildReviewPrompt(input);
   assert.match(p, /You have read-only tools/);
-  assert.match(p, /You may NOT recommend allow/);
+  assert.match(p, /Say allow when the user words clearly cover this call/);
   assert.match(p, /quote the user words/);
   assert.match(p, /Authorization comes ONLY from the user instructions/);
 });
@@ -27,8 +27,8 @@ test('工具面收窄到只读三个（dsh 没有 list 工具）', () => {
   assert.ok(!REVIEW_TOOLS.includes('write'));
 });
 
-test('结构化输出契约里没有 allow 选项', () => {
-  assert.deepEqual(REVIEW_SCHEMA.properties.verdict.enum, ['deny', 'ask']);
+test('结构化输出允许 allow（放行由它的判断 + 策略兜底）', () => {
+  assert.deepEqual(REVIEW_SCHEMA.properties.verdict.enum, ['allow', 'deny', 'ask']);
 });
 
 function fakeCtx(runResult, { providers = ['in-process'] } = {}) {
@@ -60,7 +60,7 @@ test('把请求交给独立 agent：只读工具 + 结构化 schema + 单层深�
   assert.equal(out.via, 'agent');
   const req = ctx.calls[0].req;
   assert.deepEqual(req.toolFilter.allow, REVIEW_TOOLS);
-  assert.equal(req.outputSchema, REVIEW_SCHEMA);
+  assert.deepEqual(req.outputSchema.properties.verdict.enum, ['allow', 'deny', 'ask']);
   assert.equal(req.maxDepth, 1);
   assert.ok(ctx.calls.some((c) => c.disposed), '必须释放 run');
 });

@@ -432,11 +432,14 @@ export function apply(ctx, config = {}) {
         cleared: judged.clear.map((c) => c.lock), blast: judged.blast, dataClass: judged.dataClass,
         consistency: judged.consistency,
       });
-      if (uncovered.length > 0 || judged.uncovered.length > 0) return undefined;
+      // 覆盖：要么目标全被覆盖，要么审查 agent 直接判定 allow（它有权这么说）
+      const allCovered = uncovered.length === 0 && judged.uncovered.length === 0;
+      const saysAllow = judged.verdict === 'allow';
+      if (!allCovered && !saysAllow) return undefined;
 
-      // 每把锁都必须被解释过，且解释必须附引文
+      // 每把锁都必须被解释过，且解释必须附引文；审查 agent 判 allow 时视为已解释
       const clearedSet = new Set(judged.clear.filter((c) => c.quote).map((c) => c.lock));
-      if (!locks.every((l) => clearedSet.has(l))) return undefined;
+      if (!saysAllow && !locks.every((l) => clearedSet.has(l))) return undefined;
 
       // 后果语义（由审查 agent 自己查出来的）：不可逆或影响面过大 → 不放行
       const blast = judged.blast;
@@ -1077,6 +1080,12 @@ export function apply(ctx, config = {}) {
         audit({ event: 'deny', by: 'verifier-ask', sid, tool: exec.name, class: klass.key, reason: judgeReview.text });
         return { kind: 'deny', reason: judgeReview.text, alternatives: judgeReview.alternatives };
       }
+      // 审查 agent 明确说 allow，且没有硬锁 → 依它的判断放行（它的上下文比策略更全）
+      if (judgeReview?.verdict === 'allow' && !locksOf(klass, effect).some((l) => l === 'sensitive' || l === 'unknown')) {
+        store.bump(sid, 'allow');
+        audit({ event: 'allow', by: 'reviewer-allow', sid, tool: exec.name, class: klass.key, reason: judgeReview.text });
+        return next();
+      }
       return guardAsk(
         exec.agent,
         askDecision(
@@ -1106,6 +1115,11 @@ export function apply(ctx, config = {}) {
       store.bump(sid, 'deny');
       audit({ event: 'deny', by: 'verifier-ask', sid, tool: exec.name, class: klass.key, reason: review.text });
       return { kind: 'deny', reason: review.text, alternatives: review.alternatives };
+    }
+    if (review?.verdict === 'allow' && !locksOf(klass, effect).some((l) => l === 'sensitive' || l === 'unknown')) {
+      store.bump(sid, 'allow');
+      audit({ event: 'allow', by: 'reviewer-allow', sid, tool: exec.name, class: klass.key, reason: review.text });
+      return next();
     }
     return guardAsk(
       exec.agent,
