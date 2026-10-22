@@ -59,6 +59,8 @@ export const DEFAULTS = {
   evidenceTurns: 5,
   verifierScope: 'workspace',
   scriptAudit: 'on',
+  authStyle: 'strict',
+  customScope: '',
   verifierAsk: 'on',
   provenanceMode: 'on',
   coverageMode: 'on',
@@ -100,6 +102,8 @@ export const Config = Schema.object({
   evidenceWindow: Schema.union(['latest', 'recent', 'session']).default('latest').description('授权证据窗口：只看最后一条指令（默认）或整个会话'),
   evidenceTurns: Schema.number().default(5).description('送给意图抽取的最近对话轮数（只用于消歧，不构成授权）'),
   verifierScope: Schema.union(['workspace', 'any']).default('workspace').description('核查探针的范围：默认只看工作区（软链解析后）'),
+  authStyle: Schema.union(['strict', 'goal', 'custom']).default('strict').description('授权风格：strict=未被原话覆盖即范围外；goal=服务目标即可；custom=用 customScope'),
+  customScope: Schema.string().default('').description('authStyle=custom 时的范围说明'),
   scriptAudit: Schema.union(['off', 'on']).default('on').description('脚本可读化：静态检查无危险 API 的脚本可按引文放行'),
   verifierAsk: Schema.union(['off', 'on']).default('on').description('询问时由独立 verifier 生成四段式问题（只能收紧）'),
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
@@ -506,6 +510,10 @@ export function apply(ctx, config = {}) {
           instructions,
           turns,
           state: taskContextText(exec, sid, { op: klass.op, targets, cwd }),
+          style: cfg.authStyle,
+          customScope: cfg.customScope,
+        style: cfg.authStyle,
+        customScope: cfg.customScope,
         }, { timeoutMs: Math.max(5000, cfg.judgeTimeoutMs) });
         if (agentReview) {
           const text = renderAsk({
