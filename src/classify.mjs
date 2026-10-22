@@ -244,6 +244,11 @@ export function parseShell(command, cwd, depth = 0) {
     opaque,
     elevated,
     source: 'shell',
+    // 置信度：这条"是什么效果"的结论有多可靠。
+    //   high   = 每个分段首词都在读动词表里（provenRead），或纯查询
+    //   medium = 整体认出但存在包装/变量
+    //   low    = 认不出来（other）
+    confidence: provenRead || plainQuery ? 'high' : (op === 'other' ? 'low' : 'medium'),
     raw: text.slice(0, 400),
   };
 }

@@ -46,12 +46,31 @@ export class CapgateStore {
       s = {
         grants: new Map(), denials: new Map(), pending: new Map(), entities: [],
         repeats: new Map(), counters: { allow: 0, ask: 0, deny: 0, grant: 0, judge: 0, proof: 0, citation: 0, reuse: 0, rule: 0, verify: 0, script: 0 },
-        approvals: new Map(), extents: new Map(), decisions: [],
+        approvals: new Map(), extents: new Map(), decisions: [], deniedEff: new Map(),
         createdAt: now(),
       };
       this.sessions.set(id, s);
     }
     return s;
+  }
+
+  /** 反绕过：同一效果指纹被拒过就记住（会话内，带 TTL）。 */
+  rememberDenied(sessionId, fp, sig, ttlMs = 30 * 60 * 1000) {
+    const s = this.session(sessionId);
+    const prev = s.deniedEff.get(fp);
+    s.deniedEff.set(fp, { at: now(), count: (prev?.count ?? 0) + 1, sig: sig ?? prev?.sig, ttlMs });
+  }
+
+  deniedInfo(sessionId, fp) {
+    const s = this.session(sessionId);
+    const rec = s.deniedEff.get(fp);
+    if (!rec) return undefined;
+    if (now() - rec.at > (rec.ttlMs ?? 30 * 60 * 1000)) { s.deniedEff.delete(fp); return undefined; }
+    return rec;
+  }
+
+  deniedCount(sessionId, fp) {
+    return this.deniedInfo(sessionId, fp)?.count ?? 0;
   }
 
   /** 记一条判定（任务状态用）：只保留最近 200 条。 */

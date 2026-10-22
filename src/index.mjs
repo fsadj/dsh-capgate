@@ -21,7 +21,9 @@ import { findReadContent, hashText } from './readlog.mjs';
 import { collectProvenance, allCreated, allRead } from './provenance.mjs';
 import { judgeCoverage } from './coverage.mjs';
 import { absoluteDanger, resolveEffect, loadShapeCache, flushShapeCache } from './effects.mjs';
-import { reviewWithAgent, loadReviewCache, flushReviewCache } from './reviewer.mjs';
+import { reviewWithAgent, loadReviewCache, flushReviewCache, checkCoverage } from './reviewer.mjs';
+import { effectFingerprint } from './bypass.mjs';
+import { chooseView, applyView } from './outputview.mjs';
 import { buildTaskState, relationOf, renderTaskState } from './taskstate.mjs';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { parseIntent, extractIntent, callModel } from './intent.mjs';
@@ -65,6 +67,7 @@ export const DEFAULTS = {
   benchOut: '',
   blastLimit: 1000,
   cachePath: '',
+  outputMinimize: 'on',
   reviewerModel: '',
   taskId: '',
   ruleAllowTools: [],
@@ -102,6 +105,7 @@ export const Config = Schema.object({
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
   readGate: Schema.union(['off', 'shadow', 'on']).default('shadow').description('读闸门：shadow=只记录词法与语义是否一致；on=语义不同意就不放行'),
+  outputMinimize: Schema.union(['off', 'on']).default('on').description('结果侧最小化：对工具返回做裁剪与脱敏'),
   cachePath: Schema.string().default('').description('语义/判定缓存的落盘路径（空=仅内存）'),
   reviewerModel: Schema.string().default('').description('审查 agent 使用的模型（空=同会话）'),
   blastLimit: Schema.number().default(1000).description('审查 agent 估出的影响面超过该值就不自动放行'),
@@ -356,8 +360,14 @@ export function apply(ctx, config = {}) {
    *   shadow — 照旧放行，但记录词法与语义是否一致（用来量词法的错误率）
    *   on     — 语义必须同意"读"，否则不放行（fail-closed）
    */
-  async function readGate(exec, klass, sid) {
-    if (cfg.readGate === 'off') return 'ok';
+  async function readGate(exec, klass, sid, effect) {
+    // 置信度低（认不出动词、靠包装认出来的）不允许 shadow 放过：
+    // 等价于把这一条强制提升到 readGate=on。
+    const lowConfidence = effect?.confidence === 'low';
+    if (cfg.readGate === 'off' && !lowConfidence) return 'ok';
+    if (lowConfidence) {
+      audit({ event: 'read_gate', sid, tool: exec.name, class: klass.key, mode: 'forced', reason: 'low-confidence' });
+    }
     let sem;
     try {
       sem = await resolveEffect(ctx, exec.agent, {
@@ -605,6 +615,26 @@ export function apply(ctx, config = {}) {
     const { effect, klass, cwd } = classified;
     const label = describeClass(klass);
 
+    // 0b 会话级反绕过：同一个效果（换个写法/换个工具）刚被拒过 → 直接拒，不再问人。
+    const fp = effectFingerprint({
+      op: klass.op,
+      targets: effect.targets.filter((t) => t.kind === 'path' || t.kind === 'db').map((t) => t.value),
+    });
+    const sig = exec.name + '|' + stableKey(exec.arguments);
+    const noteDeny = () => { try { store.rememberDenied(sid, fp, sig); } catch { /* ignore */ } };
+    const deniedInfo = store.deniedInfo(sid, fp);
+    // 同一个效果、但写法/工具变了 → 判为绕过，直接拒；同一签名重复 → 交给原有的重复计数（第三次转人工）
+    const deniedBefore = deniedInfo && deniedInfo.sig !== sig ? deniedInfo.count : 0;
+    if (deniedBefore > 0) {
+      audit({ event: 'deny', by: 'anti-bypass', sid, tool: exec.name, class: klass.key, fp, count: deniedBefore });
+      store.bump(sid, 'deny');
+      return {
+        kind: 'deny',
+        reason: `capgate: 同一个效果刚才已被拒绝（第 ${deniedBefore + 1} 次尝试，仅换了写法）。`
+          + '换一种工具或措辞不会改变判定；如果确实需要，请让用户明确说出范围。',
+      };
+    }
+
     // 完全相同的调用只问一次：签名 = tool + 稳定序列化的参数
     const signature = `${exec.name}|${stableKey(exec.arguments)}`;
     if (exec.callId) signatures.set(String(exec.callId), signature);
@@ -722,7 +752,7 @@ export function apply(ctx, config = {}) {
     //     readGate=shadow：只记录词法与语义是否一致（不改行为，用来量错误率）
     //     readGate=on    ：语义必须也说"读"，否则不放行（fail-closed）
     if (cfg.autoAllowReads && klass.op === 'read' && klass.scope === 'workspace') {
-      const gate = await readGate(exec, klass, sid);
+      const gate = await readGate(exec, klass, sid, effect);
       if (gate === 'ok') {
         store.bump(sid, 'allow');
         store.bump(sid, 'proof'); audit({ event: 'allow', by: 'read-fast-path', sid, tool: exec.name, class: klass.key });
@@ -732,7 +762,7 @@ export function apply(ctx, config = {}) {
 
     // 1.3b 项目外普通读（同样要过读闸门；形状缓存让第二次判断不再花调用）
     if (cfg.autoAllowOutsideReads && klass.op === 'read') {
-      const gate = await readGate(exec, klass, sid);
+      const gate = await readGate(exec, klass, sid, effect);
       if (gate === 'ok') {
         store.bump(sid, 'allow');
         store.bump(sid, 'proof'); audit({ event: 'allow', by: 'outside-read-fast-path', sid, tool: exec.name, class: klass.key });
@@ -905,6 +935,7 @@ export function apply(ctx, config = {}) {
         op: klass.op,
         targets: effect.targets.filter((t) => t.kind === 'path').map((t) => t.value),
       });
+      noteDeny();
       audit({ event: 'deny', reason: 'outside-no-citation', sid, tool: exec.name, class: klass.key, why: evidence.why, count: n, repeats, alternatives: outOpts.map((o) => o.label) });
       if (n >= cfg.maxConsecutiveDenials || repeats > cfg.maxRepeats) {
         store.rememberPending(sid, exec.callId, { key: klass.key, label, autoEligible: false });
@@ -1137,7 +1168,38 @@ export function apply(ctx, config = {}) {
     );
   }, { prepend: true });
 
-  // ---- 2. 审批裁决 ----
+  // ---- 2. 结果侧最小化：控制 agent 能看到多少 ----
+  // 动作侧最小化只能管"能不能做"，数据最小化的另一半是"看到多少"。
+  ctx.on('tools/post-execute', async (exec, result, next) => {
+    let decision;
+    try { decision = await next(); } catch { return next(); }
+    try {
+      if (cfg.outputMinimize !== 'on') return decision;
+      if (!exec?.agent || !active(exec.agent)) return decision;
+      // 子 agent（审查者）自己取证时不裁剪，否则它看不到该看的东西
+      if (exec.agent?.session?.parentSession) return decision;
+      if (decision?.kind !== 'accept' || !decision.content) return decision;
+
+      const classified = classOfCall(exec.agent, exec.name, exec.arguments);
+      if (!classified) return decision;
+      const { effect, klass } = classified;
+      const view = chooseView({
+        op: klass.op,
+        scope: klass.scope,
+        cardinality: cardinalityOf(effect),
+      });
+      if (!view) return decision;
+
+      const { content, note } = applyView(decision.content, view);
+      if (!note) return decision;
+      audit({ event: 'output_trim', sid: sidOf(exec.agent), tool: exec.name, class: klass.key, note });
+      return { ...decision, content };
+    } catch {
+      return decision;
+    }
+  }, { prepend: true });
+
+  // ---- 3. 审批裁决 ----
   ctx.on('approval/request', async (req, next) => {
     // 我们自己发起的嵌套询问：交回下游（浏览器面板），避免递归
     if (typeof req.reason === 'string' && req.reason.startsWith('capgate:')) return next();

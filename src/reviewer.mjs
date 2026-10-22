@@ -1,4 +1,5 @@
 import { readFileSync, writeFileSync } from 'node:fs';
+import { classifyFailure, shouldRetry, FailureKind } from './failures.mjs';
 /**
  * 审查 agent：让"承重"落在一个独立的 agent 个体上，而不是插件里的几次提示词调用。
  *
@@ -271,10 +272,49 @@ async function attemptOnce(ctx, svc, name, input, { tools, allow, budget, agent 
     }
     return undefined;
   } catch (e) {
-    console.warn('[capgate] reviewer failed: ' + (e && e.message ? e.message : e));
+    const kind = classifyFailure(e);
+    console.warn('[capgate] reviewer failed (' + kind + '): ' + (e && e.message ? e.message : e));
+    if (kind === FailureKind.TIMEOUT || shouldRetry(kind)) return undefined; // 交给外层重试
     return undefined;
   } finally {
     clearTimeout(timer);
     try { await run?.dispose?.(); } catch { /* 忽略 */ }
   }
+}
+
+/* ─────────── 覆盖守卫 + 严格终局 ─────────── */
+
+/**
+ * 覆盖守卫：一些结论必须有证据支撑，否则不算数。
+ * 这条替代了"agent 想说啥说啥"——缺证据就降级为 ask。
+ *
+ * @param {object} out 审查结果
+ * @param {{op:string, locks:string[]}} call
+ * @returns {{ok:boolean, missing:string[]}}
+ */
+export function checkCoverage(out, call) {
+  const missing = [];
+  if (!out) return { ok: false, missing: ['verdict'] };
+  if (out.verdict === 'allow') {
+    // allow 必须有"覆盖到哪些目标"或明确的 facts，否则视为没调查
+    if (!(out.covered?.length > 0 || out.facts?.length > 0)) missing.push('covered|facts');
+  }
+  const op = call?.op;
+  if ((op === 'read' || op === 'send') && !out.dataClass) missing.push('dataClass');
+  if ((call?.locks ?? []).some((l) => l === 'batch' || l === 'egress') && !out.blast) missing.push('blast');
+  return { ok: missing.length === 0, missing };
+}
+
+/** 缺证据时给模型的修正提示（只修一次）。 */
+export function buildRepairPrompt(missing) {
+  return [
+    'Your previous answer was incomplete for these fields: ' + missing.join(', '),
+    'Give the full JSON again. Do not change your verdict unless the missing evidence changes it.',
+    'Required: verdict, action, and the missing fields above.',
+  ].join('\n');
+}
+
+/** 宽松判定：判定是否直接采用（供策略层调用） */
+export function isDecisive(out) {
+  return !!out && (out.verdict === 'allow' || out.verdict === 'deny');
 }
