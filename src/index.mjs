@@ -22,6 +22,7 @@ import { collectProvenance, allCreated, allRead } from './provenance.mjs';
 import { judgeCoverage } from './coverage.mjs';
 import { absoluteDanger, resolveEffect } from './effects.mjs';
 import { reviewWithAgent } from './reviewer.mjs';
+import { buildTaskState, relationOf, renderTaskState } from './taskstate.mjs';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { parseIntent, extractIntent, callModel } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
@@ -160,7 +161,22 @@ export function apply(ctx, config = {}) {
   const mode = () => readMode(cfg.mode) ?? 'capgate';
   const sidOf = (agent) => String(agent?.session?.id ?? 'anonymous');
   const cwdOf = (agent) => cfg.workspaceRoot || agent?.session?.header?.cwd || process.cwd();
-  const audit = (entry) => { try { store.audit(entry); } catch { /* 审计失败不影响判定 */ } };
+  const audit = (entry) => {
+    try { store.audit(entry); } catch { /* 审计失败不影响判定 */ }
+    // 同时留一份判定流水在内存里，供"任务状态"使用（不落盘、不跨会话）
+    try {
+      if (entry.sid && ['allow', 'deny', 'ask', 'grant'].includes(entry.event)) {
+        store.record(entry.sid, {
+          event: entry.event,
+          by: entry.by,
+          op: entry.op ?? (entry.class ? String(entry.class).split('|')[0] : undefined),
+          target: (Array.isArray(entry.targets) ? entry.targets[0] : undefined) ?? entry.cited,
+          class: entry.class,
+          why: entry.why ?? entry.reason,
+        });
+      }
+    } catch { /* 记录失败不影响判定 */ }
+  };
 
   function presetAllows(agent) {
     if (!cfg.requiredPreset) return true;
@@ -313,6 +329,23 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * 任务状态文本：把整条任务弧线（指令 / 已批准 / 已拒绝 / 近期判定 / 进度 / 本次调用 / 关系）
+   * 交给判断方。机器能算的关系先算，算不出的留给它判断。
+   */
+  function taskContextText(exec, sid, call) {
+    try {
+      const state = buildTaskState(exec.agent, {
+        decisions: store.decisions(sid),
+        cwd: call?.cwd ?? '',
+        call: { op: call?.op, targets: call?.targets ?? [] },
+      });
+      return renderTaskState(state, relationOf(state, call?.targets ?? []));
+    } catch {
+      return '(task state unavailable)';
+    }
+  }
+
+  /**
    * 读闸门：词法说"这是读"时，放行前问一次语义。
    * 三种模式：
    *   off    — 维持旧行为（不放语义调用）
@@ -377,6 +410,7 @@ export function apply(ctx, config = {}) {
       // 判断交给独立审查 agent：它可以自己枚举、抽样、看内容，然后给出语义结论。
       // 我们只把结论映射成动作。
       const probe = verify({ op: klass.op, targets }, { scope: { mode: cfg.verifierScope, root: cwd ?? '' } });
+      const stateText = taskContextText(exec, sid, { op: klass.op, targets, cwd });
       const judged = await reviewWithAgent(ctx, exec.agent, {
         tool: exec.name,
         args: JSON.stringify(exec.arguments ?? {}),
@@ -386,6 +420,7 @@ export function apply(ctx, config = {}) {
         facts: factList(probe),
         instructions,
         turns,
+        state: stateText,
       }, { timeoutMs: Math.max(10000, cfg.judgeTimeoutMs), retries: 1 });
       if (!judged) return undefined;
 
@@ -453,6 +488,7 @@ export function apply(ctx, config = {}) {
           facts,
           instructions,
           turns,
+          state: taskContextText(exec, sid, { op: klass.op, targets, cwd }),
         }, { timeoutMs: Math.max(5000, cfg.judgeTimeoutMs) });
         if (agentReview) {
           const text = renderAsk({

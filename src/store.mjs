@@ -46,12 +46,23 @@ export class CapgateStore {
       s = {
         grants: new Map(), denials: new Map(), pending: new Map(), entities: [],
         repeats: new Map(), counters: { allow: 0, ask: 0, deny: 0, grant: 0, judge: 0, proof: 0, citation: 0, reuse: 0, rule: 0, verify: 0, script: 0 },
-        approvals: new Map(), extents: new Map(),
+        approvals: new Map(), extents: new Map(), decisions: [],
         createdAt: now(),
       };
       this.sessions.set(id, s);
     }
     return s;
+  }
+
+  /** 记一条判定（任务状态用）：只保留最近 200 条。 */
+  record(sessionId, entry) {
+    const s = this.session(sessionId);
+    s.decisions.push({ seq: s.decisions.length + 1, at: now(), ...entry });
+    if (s.decisions.length > 200) s.decisions.splice(0, s.decisions.length - 200);
+  }
+
+  decisions(sessionId) {
+    return this.session(sessionId).decisions;
   }
 
   bump(sessionId, kind) {
