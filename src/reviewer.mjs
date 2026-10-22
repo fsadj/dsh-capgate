@@ -94,6 +94,7 @@ export function buildReviewPrompt(input, { allow = false } = {}) {
       : '- Say allow when the user words clearly cover this call. Say deny when they clearly do not, or when a hard rule is broken. Say ask when you are unsure or when a human should decide.',
     '- To clear a lock you must quote the user words that make the intent unambiguous.',
     '- When unsure, prefer ask and say exactly what is missing.',
+    '- Naming a path or a thing is NOT a request to act on it. Without an action the user asked for, answer ask.',
     '- Put a strictly narrower alternative in alternatives when the call is too broad (less data, fewer files, or a dry run).',
     '',
     'TOOL: ' + input.tool,
