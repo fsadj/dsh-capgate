@@ -2,17 +2,42 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { apply } from '../src/index.mjs';
 import { buildCoveragePrompt, parseCoverage } from '../src/coverage.mjs';
+import { clearReviewCache } from '../src/reviewer.mjs';
 
 function fakeLlm(json) {
   return { stream: async function* () { yield { type: 'text-delta', text: json }; yield { type: 'finish' }; } };
 }
 
 function harness(userText, llmJson) {
+  clearReviewCache();
   const handlers = new Map();
   const ctx = {
     on(ev, fn) { handlers.set(ev, fn); return () => {}; },
     systemPrompt: { section() {} },
-    get: (n) => (n === 'llm' ? fakeLlm(llmJson) : undefined),
+    get: (n) => {
+      if (n === 'llm') return fakeLlm(llmJson);
+      if (n === 'subagents' || n === 'subagent') {
+        // 语义解除现在由独立审查 agent 完成：把同一份 JSON 当作它的结构化输出
+        const st = JSON.parse(llmJson);
+        return {
+          list: () => ['in-process'],
+          start: async () => ({
+            id: 'r',
+            result: Promise.resolve({
+              structured: {
+                verdict: st.verdict ?? 'ask',
+                action: st.action ?? 'x',
+                covered: (st.covered ?? []).map((c) => c.target),
+                uncovered: (st.uncovered ?? []),
+                clear: (st.clear ?? []),
+              },
+            }),
+            dispose: async () => {},
+          }),
+        };
+      }
+      return undefined;
+    },
   };
   apply(ctx, { mode: 'capgate', workspaceRoot: 'C:/repo', judgeMode: 'off' });
   const agent = {

@@ -62,6 +62,7 @@ export const DEFAULTS = {
   readGate: 'shadow',
   reviewerMode: 'agent',
   benchOut: '',
+  blastLimit: 1000,
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -98,6 +99,7 @@ export const Config = Schema.object({
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
   readGate: Schema.union(['off', 'shadow', 'on']).default('shadow').description('读闸门：shadow=只记录词法与语义是否一致；on=语义不同意就不放行'),
+  blastLimit: Schema.number().default(1000).description('审查 agent 估出的影响面超过该值就不自动放行'),
   benchOut: Schema.string().default('').description('评测用：设置后第一次工具调用时跑纯 agent 评测并写入该文件'),
   reviewerMode: Schema.union(['off', 'agent']).default('agent').description('审查由独立 subagent 承担（只读工具 + 结构化输出）；不可用时自动退回提示词审查'),
   taskId: Schema.string().default('').description('空 = 用会话 id'),
@@ -365,23 +367,52 @@ export function apply(ctx, config = {}) {
         .map((t) => t.value);
       if (targets.length === 0) return undefined;
 
-      const ev = collectEvidence(exec.agent, { window: cfg.evidenceWindow, recent: cfg.evidenceRecent });
+      const ev = collectEvidence(exec.agent, { window: cfg.evidenceWindow, recent: cfg.evidenceRecent, turns: cfg.evidenceTurns });
       const instructions = ev.instructions.map((m) => instructionOnly(m.text)).filter(Boolean).join('\n').slice(-1500);
+      const turns = ev.turns
+        .map((t) => [t.user && (`USER: ${t.user}`), t.assistant && (`ASSISTANT: ${t.assistant}`)].filter(Boolean).join('\n'))
+        .join('\n---\n')
+        .slice(-1500);
 
-      const judged = await judgeCoverage(ctx, exec.agent, {
-        op: klass.op, targets, entries, instructions, locks, cwd, timeoutMs: cfg.judgeTimeoutMs,
-      });
+      // 判断交给独立审查 agent：它可以自己枚举、抽样、看内容，然后给出语义结论。
+      // 我们只把结论映射成动作。
+      const probe = verify({ op: klass.op, targets }, { scope: { mode: cfg.verifierScope, root: cwd ?? '' } });
+      const judged = await reviewWithAgent(ctx, exec.agent, {
+        tool: exec.name,
+        args: JSON.stringify(exec.arguments ?? {}),
+        op: klass.op,
+        targets,
+        locks,
+        facts: factList(probe),
+        instructions,
+        turns,
+      }, { timeoutMs: Math.max(10000, cfg.judgeTimeoutMs), retries: 1 });
       if (!judged) return undefined;
+
+      const coveredTargets = new Set(judged.covered);
+      const uncovered = targets.filter((t) => !coveredTargets.has(t));
       audit({
-        event: 'coverage', sid, tool: exec.name, class: klass.key, locks,
-        covered: judged.covered.map((c) => `${c.target}#${c.entry}`),
-        uncovered: judged.uncovered, cleared: judged.clear.map((c) => c.lock), all: judged.allCovered,
+        event: 'coverage', sid, tool: exec.name, class: klass.key, locks, via: judged.via,
+        covered: [...coveredTargets], uncovered,
+        cleared: judged.clear.map((c) => c.lock), blast: judged.blast, dataClass: judged.dataClass,
+        consistency: judged.consistency,
       });
-      if (!judged.allCovered) return undefined;
+      if (uncovered.length > 0 || judged.uncovered.length > 0) return undefined;
 
       // 每把锁都必须被解释过，且解释必须附引文
       const clearedSet = new Set(judged.clear.filter((c) => c.quote).map((c) => c.lock));
       if (!locks.every((l) => clearedSet.has(l))) return undefined;
+
+      // 后果语义（由审查 agent 自己查出来的）：不可逆或影响面过大 → 不放行
+      const blast = judged.blast;
+      if (blast) {
+        if (blast.reversible === 'no') return undefined;
+        if (Number.isFinite(blast.estimate) && blast.estimate > cfg.blastLimit) return undefined;
+      }
+      // 数据和调用所声称的动作不一致 → 不放行
+      if (judged.consistency === 'mismatch') return undefined;
+      // 凭据类数据 → 永不放行（由 agent 判定，不靠路径表）
+      if (judged.dataClass === 'credential') return undefined;
       return judged;
     } catch (err) {
       audit({ event: 'coverage_failed', sid, tool: exec.name, reason: String(err && err.message ? err.message : err) });
@@ -1005,7 +1036,7 @@ export function apply(ctx, config = {}) {
         : effect.opaque ? '不透明执行（脚本/解释器）需要你确认'
         : '需要你确认';
       const judgeReview = await askViaVerifier(exec, { label, klass, effect, reason: judgement.reason, cwd });
-      if (judgeReview?.verdict === 'deny') {
+      if (judgeReview?.verdict === 'deny' || judgeReview?.dataClass === 'credential' || judgeReview?.consistency === 'mismatch') {
         store.bump(sid, 'deny');
         audit({ event: 'deny', by: 'verifier-ask', sid, tool: exec.name, class: klass.key, reason: judgeReview.text });
         return { kind: 'deny', reason: judgeReview.text, alternatives: judgeReview.alternatives };
@@ -1035,7 +1066,7 @@ export function apply(ctx, config = {}) {
     // 让独立的 verifier 把这次询问写成「动作 / 事实 / 建议 / 可替代」四段式。
     // 它只能收紧（建议拒绝）或把问题问得更好，不能放行。
     const review = await askViaVerifier(exec, { label, klass, effect, reason: evidence.why, cwd });
-    if (review?.verdict === 'deny') {
+    if (review?.verdict === 'deny' || review?.dataClass === 'credential' || review?.consistency === 'mismatch') {
       store.bump(sid, 'deny');
       audit({ event: 'deny', by: 'verifier-ask', sid, tool: exec.name, class: klass.key, reason: review.text });
       return { kind: 'deny', reason: review.text, alternatives: review.alternatives };

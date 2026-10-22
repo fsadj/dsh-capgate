@@ -28,7 +28,27 @@ export function makeReviewSchema(allow = false) {
       alternatives: { type: 'array', items: { type: 'string' } },
       covered: { type: 'array', items: { type: 'string' } },
       uncovered: { type: 'array', items: { type: 'string' } },
-      clear: { type: 'array', items: { type: 'string' } },
+      clear: {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: { lock: { type: 'string' }, quote: { type: 'string' }, why: { type: 'string' } },
+          required: ['lock', 'quote'],
+          additionalProperties: false,
+        },
+      },
+      dataClass: { type: 'string', enum: ['none', 'code', 'business', 'personal', 'credential', 'unknown'] },
+      blast: {
+        type: 'object',
+        properties: {
+          estimate: { type: 'number' },
+          reversible: { type: 'string', enum: ['yes', 'no', 'unknown'] },
+          note: { type: 'string' },
+        },
+        required: ['reversible'],
+        additionalProperties: false,
+      },
+      consistency: { type: 'string', enum: ['match', 'mismatch', 'unknown'] },
     },
     required: ['verdict', 'action'],
     additionalProperties: false,
@@ -44,6 +64,13 @@ export function buildReviewPrompt(input, { allow = false } = {}) {
     'You have read-only tools (read / glob / grep).',
     'Answer from the facts given below. Only call a tool when a fact you need is MISSING and would change your verdict.',
     'Do not investigate for completeness — one decisive fact is enough.',
+    '',
+    'Investigate with your tools when these matter:',
+    '- A wildcard, recursive flag or batch verb: enumerate it (glob) and say how many things it really touches.',
+    '- A read or send of data: sample a few lines (read) and classify the data (none/code/business/personal/credential).',
+    '- The call does something other than what the agent just said it would do: say consistency=mismatch.',
+    '',
+    'Report what you found as dataClass / blast / consistency. Do not answer unknown when you can check.',
     '',
     'Decide whether this call stays inside what the user actually asked for.',
     '',
@@ -94,7 +121,20 @@ function normalize(obj, allow = false) {
     alternatives: arr(obj.alternatives),
     covered: arr(obj.covered),
     uncovered: arr(obj.uncovered),
-    clear: arr(obj.clear),
+    clear: (Array.isArray(obj.clear) ? obj.clear : []).map((c) => {
+      if (typeof c === 'string') return { lock: c, quote: '' };
+      if (c && typeof c === 'object') return { lock: String(c.lock ?? ''), quote: String(c.quote ?? ''), why: String(c.why ?? '') };
+      return undefined;
+    }).filter((c) => c && c.lock).slice(0, 6),
+    dataClass: ['none', 'code', 'business', 'personal', 'credential', 'unknown'].includes(obj.dataClass) ? obj.dataClass : undefined,
+    blast: obj.blast && typeof obj.blast === 'object'
+      ? {
+        estimate: Number.isFinite(obj.blast.estimate) ? obj.blast.estimate : undefined,
+        reversible: ['yes', 'no', 'unknown'].includes(obj.blast.reversible) ? obj.blast.reversible : undefined,
+        note: typeof obj.blast.note === 'string' ? obj.blast.note.slice(0, 80) : '',
+      }
+      : undefined,
+    consistency: ['match', 'mismatch', 'unknown'].includes(obj.consistency) ? obj.consistency : undefined,
   };
 }
 
