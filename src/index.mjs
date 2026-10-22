@@ -20,8 +20,8 @@ import { inspectScript } from './scriptaudit.mjs';
 import { findReadContent, hashText } from './readlog.mjs';
 import { collectProvenance, allCreated, allRead } from './provenance.mjs';
 import { judgeCoverage } from './coverage.mjs';
-import { absoluteDanger, resolveEffect } from './effects.mjs';
-import { reviewWithAgent } from './reviewer.mjs';
+import { absoluteDanger, resolveEffect, loadShapeCache, flushShapeCache } from './effects.mjs';
+import { reviewWithAgent, loadReviewCache, flushReviewCache } from './reviewer.mjs';
 import { buildTaskState, relationOf, renderTaskState } from './taskstate.mjs';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
 import { parseIntent, extractIntent, callModel } from './intent.mjs';
@@ -64,6 +64,8 @@ export const DEFAULTS = {
   reviewerMode: 'agent',
   benchOut: '',
   blastLimit: 1000,
+  cachePath: '',
+  reviewerModel: '',
   taskId: '',
   ruleAllowTools: [],
   ruleDenyTools: [],
@@ -100,6 +102,8 @@ export const Config = Schema.object({
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
   readGate: Schema.union(['off', 'shadow', 'on']).default('shadow').description('读闸门：shadow=只记录词法与语义是否一致；on=语义不同意就不放行'),
+  cachePath: Schema.string().default('').description('语义/判定缓存的落盘路径（空=仅内存）'),
+  reviewerModel: Schema.string().default('').description('审查 agent 使用的模型（空=同会话）'),
   blastLimit: Schema.number().default(1000).description('审查 agent 估出的影响面超过该值就不自动放行'),
   benchOut: Schema.string().default('').description('评测用：设置后第一次工具调用时跑纯 agent 评测并写入该文件'),
   reviewerMode: Schema.union(['off', 'agent']).default('agent').description('审查由独立 subagent 承担（只读工具 + 结构化输出）；不可用时自动退回提示词审查'),
@@ -1493,6 +1497,17 @@ export function apply(ctx, config = {}) {
   if (typeof commandTimer.unref === 'function') commandTimer.unref();
 
   // ---- 5. 模型侧说明 ----
+  // 缓存落盘：重启后仍然免调模型（形状 → 效果、判定 → 结论）
+  if (cfg.cachePath) {
+    try {
+      const n1 = loadShapeCache(cfg.cachePath + '.shape.json');
+      const n2 = loadReviewCache(cfg.cachePath + '.review.json');
+      if (n1 || n2) console.log(`[capgate] cache loaded shape=${n1} review=${n2}`);
+    } catch { /* 缓存不可用不影响判定 */ }
+    const flush = () => { try { flushShapeCache(); flushReviewCache(); } catch { /* ignore */ } };
+    process.once?.('exit', flush);
+    setInterval(flush, 30000).unref?.();
+  }
   try {
     ctx.systemPrompt?.section?.({
       name: 'tool:capgate',

@@ -9,7 +9,9 @@
  * 设计要点：形状缓存缓存的是 **op**（读/写/删/发/执行），不是结果。
  * 目标仍然从本次调用的参数里取，所以不会把上次的路径带到这次。
  */
+import { readFileSync, writeFileSync } from 'node:fs';
 import { compileEffects } from './intent.mjs';
+import { seededOp } from './speedups.mjs';
 
 /**
  * 绝对危险：命中的不是"可疑"，而是"确定会造成不可逆损害"。
@@ -52,8 +54,27 @@ export function shapeOf(text) {
   return s.slice(0, 400);
 }
 
-/** 形状 → op 的缓存（进程内）。 */
+/** 形状 → op 的缓存（进程内，可落盘）。 */
 const shapeCache = new Map();
+let cachePath = '';
+let dirty = false;
+
+/** 载入磁盘缓存（重启后仍然免调模型）。 */
+export function loadShapeCache(path) {
+  cachePath = path || '';
+  if (!cachePath) return 0;
+  try {
+    const obj = JSON.parse(readFileSync(cachePath, 'utf8'));
+    for (const [k, v] of Object.entries(obj || {})) shapeCache.set(k, v);
+    return shapeCache.size;
+  } catch { return 0; }
+}
+
+/** 落盘（失败不影响判定）。 */
+export function flushShapeCache() {
+  if (!cachePath || !dirty) return;
+  try { writeFileSync(cachePath, JSON.stringify(Object.fromEntries(shapeCache)), 'utf8'); dirty = false; } catch { /* ignore */ }
+}
 
 export function cacheStats() {
   return { size: shapeCache.size };
@@ -78,6 +99,13 @@ export async function resolveEffect(ctx, agent, { tool, args, timeoutMs = 8000 }
   const hit = shapeCache.get(shape);
   if (hit) return { op: hit, source: 'cache' };
 
+  // 固定规则种子：整条命令精确匹配且无管道/重定向 → 直接当读，不调模型。
+  const seeded = seededOp(text);
+  if (seeded) {
+    shapeCache.set(shape, seeded); dirty = true;
+    return { op: seeded, source: 'seed' };
+  }
+
   const compiled = await compileEffects(ctx, agent, { tool, args }, { timeoutMs });
   if (!compiled || !Array.isArray(compiled.ops) || compiled.ops.length === 0) return undefined;
 
@@ -87,6 +115,6 @@ export async function resolveEffect(ctx, agent, { tool, args, timeoutMs = 8000 }
   for (const o of order) {
     if (compiled.ops.some((x) => x.op === o)) { op = o; break; }
   }
-  shapeCache.set(shape, op);
+  shapeCache.set(shape, op); dirty = true;
   return { op, source: 'llm' };
 }

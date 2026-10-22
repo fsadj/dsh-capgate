@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync } from 'node:fs';
 /**
  * 审查 agent：让"承重"落在一个独立的 agent 个体上，而不是插件里的几次提示词调用。
  *
@@ -165,6 +166,23 @@ function normalize(obj, allow = false) {
  */
 /** 判定缓存：同样的 (tool,args,指令) 不再重复起子 agent */
 const reviewCache = new Map();
+const inFlight = new Map();
+let reviewCachePath = '';
+
+export function loadReviewCache(path) {
+  reviewCachePath = path || '';
+  if (!reviewCachePath) return 0;
+  try {
+    const obj = JSON.parse(readFileSync(reviewCachePath, 'utf8'));
+    for (const [k, v] of Object.entries(obj || {})) reviewCache.set(k, v);
+    return reviewCache.size;
+  } catch { return 0; }
+}
+
+export function flushReviewCache() {
+  if (!reviewCachePath) return;
+  try { writeFileSync(reviewCachePath, JSON.stringify(Object.fromEntries(reviewCache)), 'utf8'); } catch { /* ignore */ }
+}
 const CACHE_MAX = 200;
 
 function cacheKey(input) {
@@ -183,6 +201,10 @@ export async function reviewWithAgent(ctx, agent, input, {
   const key = cacheKey(input);
   const cached = reviewCache.get(key);
   if (cached) return { ...cached, via: 'cache' };
+  // 同一个判定的并发请求合并：第二个等待第一个的结果，不再起第二个子 agent
+  const running = inFlight.get(key);
+  if (running) return running;
+  const promise = (async () => {
 
   let svc;
   try {
@@ -213,6 +235,9 @@ export async function reviewWithAgent(ctx, agent, input, {
   }
   console.warn('[capgate] reviewer gave up after ' + (retries + 1) + ' attempt(s)');
   return undefined;
+  })();
+  inFlight.set(key, promise);
+  try { return await promise; } finally { inFlight.delete(key); }
 }
 
 /** 一次完整的子 agent 调用 */
