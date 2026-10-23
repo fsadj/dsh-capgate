@@ -766,12 +766,25 @@ export function apply(ctx, config = {}) {
       : undefined;
 
     // 1.0 用户规则（deny 优先）
+    //      规则只允许"拒绝"直接生效；"允许"在 agentFinal 打开时降级为证据，
+    //      交给审查 agent —— 变更类操作的放行不该由规则给出。
     const ruled = evaluateRules(rules, { tool: exec.name, effect });
-    if (ruled) {
-      store.bump(sid, ruled.kind === 'deny' ? 'deny' : 'allow');
-      audit({ event: ruled.kind, by: 'rule', rule: ruled.rule, sid, tool: exec.name, class: klass.key });
-      if (ruled.kind === 'deny') return { kind: 'deny', reason: `capgate 规则拒绝（${ruled.rule}）` };
+    if (ruled?.kind === 'deny') {
+      store.bump(sid, 'deny');
+      audit({ event: 'deny', by: 'rule', rule: ruled.rule, sid, tool: exec.name, class: klass.key });
+      return { kind: 'deny', reason: `capgate 规则拒绝（${ruled.rule}）` };
+    }
+    const ruleFacts = ruled?.kind === 'allow'
+      ? [`a user-configured allow rule matches this call: ${ruled.rule}`]
+      : [];
+    if (ruled?.kind === 'allow' && !cfg.agentFinal) {
+      store.bump(sid, 'allow');
+      audit({ event: 'allow', by: 'rule', rule: ruled.rule, sid, tool: exec.name, class: klass.key });
       return next();
+    }
+    if (ruleFacts.length) {
+      audit({ event: 'prior', by: 'rule', sid, tool: exec.name, class: klass.key, rule: ruled.rule });
+      if (exec.callId) citationByCall.set(String(exec.callId), ruleFacts);
     }
 
     // 1.0a 已硬化的拒绝规则（来自历史判断，只会更紧）
