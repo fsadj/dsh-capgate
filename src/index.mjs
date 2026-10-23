@@ -27,7 +27,6 @@ import { discover } from './discover.mjs';
 import { classifyAsk, askKindLabel } from './askreason.mjs';
 import { splitDecision, narrowedCommand } from './split.mjs';
 import { runProbe } from './probe.mjs';
-import { annotate, selfCheck, explainReason, REASONS, ROLE } from './roles.mjs';
 import { chooseView, applyView } from './outputview.mjs';
 import { buildTaskState, relationOf, renderTaskState } from './taskstate.mjs';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
@@ -194,11 +193,7 @@ export function apply(ctx, config = {}) {
   const sidOf = (agent) => String(agent?.session?.id ?? 'anonymous');
   const cwdOf = (agent) => cfg.workspaceRoot || agent?.session?.header?.cwd || process.cwd();
   const audit = (entry) => {
-    // 每条审计都带角色与 reason code：规则只能做"硬约束/成本分流/可解释性"三件事，
-    // 角色不明的来源会标成 unregistered，便于事后发现漏登记。
-    let record = entry;
-    try { record = annotate(entry); } catch { /* 注解失败按原样记 */ }
-    try { store.audit(record); } catch { /* 审计失败不影响判定 */ }
+    try { store.audit(entry); } catch { /* 审计失败不影响判定 */ }
     // 同时留一份判定流水在内存里，供"任务状态"使用（不落盘、不跨会话）
     try {
       if (entry.sid && ['allow', 'deny', 'ask', 'grant'].includes(entry.event)) {
@@ -1827,14 +1822,6 @@ export function apply(ctx, config = {}) {
       ].join('\n'),
     });
   } catch { /* 没有 systemPrompt 服务的组合忽略 */ }
-
-  // 启动自检：内置清单里出现的 reason 必须都在 roles 表里登记过
-  try {
-    const used = Object.keys(REASONS);
-    const check = selfCheck(used);
-    if (check.unknown.length) console.warn('[capgate] 未登记的原因码:', check.unknown.join(', '));
-    if (check.violating.length) console.warn('[capgate] 角色违规（硬约束不能作为放行来源）:', check.violating.join(', '));
-  } catch { /* 自检失败不阻塞启动 */ }
 
   for (const err of rules.errors) console.warn('[capgate] rule ignored:', err);
   console.log(`[capgate] active mode=${mode()} preset=${cfg.requiredPreset || '(any)'} `
