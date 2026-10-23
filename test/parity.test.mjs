@@ -138,10 +138,11 @@ test('明确说"跑一下构建"则放行', async () => {
   assert.equal(decision.kind, 'allow');
 });
 
-test('普通写：复核 allow + judgeAutoAllow → 直接放行，不弹卡片', async () => {
-  const h = harness('跑一下测试', { judgeMode: 'residual', judgeAutoAllow: true }, undefined, fakeLlm('allow'));
+test('普通写：没有引文时不再有"单次复核"兜底，审查 agent 不在就问人', async () => {
+  const h = harness('跑一下测试', {}, undefined, fakeLlm('allow'));
   const { decision } = await h.call('write', { file_path: 'notes.md' });
-  assert.equal(decision.kind, 'allow', '非出网/非不透明，复核可自动授予并直接放行');
+  // 判定权只在审查 agent 手上；这里没有 subagent 服务，所以只能问人
+  assert.equal(decision.kind, 'ask');
 });
 
 test('带沙箱升级的调用不再重复弹卡（交给工具的原生审批）', async () => {

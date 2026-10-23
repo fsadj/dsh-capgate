@@ -34,7 +34,6 @@ import { parseIntent, extractIntent, callModel } from './intent.mjs';
 import { CapgateStore, redact } from './store.mjs';
 import { compileRules, evaluateRules } from './rules.mjs';
 import { loadState, saveState, observe, candidates, addRule, removeRule, hasRule } from './learn.mjs';
-import { judgeResidual } from './judge.mjs';
 import { compileEffects } from './intent.mjs';
 
 export const name = 'capgate';
@@ -53,8 +52,6 @@ export const DEFAULTS = {
   maxConsecutiveDenials: 3,
   maxRepeats: 2,
   grantTtlHours: 8,
-  judgeMode: 'residual',
-  judgeAutoAllow: true,
   judgeTimeoutMs: 8000,
   verifyMode: 'on',
   intentMode: 'on',
@@ -99,8 +96,6 @@ export const Config = Schema.object({
   maxConsecutiveDenials: Schema.number().default(3).description('同一效果类连续拒绝 N 次后转人工'),
   maxRepeats: Schema.number().default(2).description('同一 (tool,args) 重复 N 次后转人工'),
   grantTtlHours: Schema.number().default(8).description('效果类授权有效期（小时）'),
-  judgeMode: Schema.union(['off', 'residual']).default('residual').description('残余 LLM 判定'),
-  judgeAutoAllow: Schema.boolean().default(true).description('允许复核放行（仅限项目内/非敏感/非批量/非出网/非不透明）'),
   judgeTimeoutMs: Schema.number().default(8000).description('复核超时；超时转人工'),
   verifyMode: Schema.union(['off', 'on']).default('on').description('独立核查：只读探针，只回事实'),
   intentMode: Schema.union(['off', 'on']).default('on').description('语义引文：从原话抽取契约条目'),
@@ -1153,7 +1148,7 @@ export function apply(ctx, config = {}) {
 
     // 1.7b "看不懂的调用"交给效果编译器：模型只负责**翻译**成字面效果，
     //      放行/询问/拒绝仍由下面的确定性规则决定。
-    if (klass.op === 'other' && cfg.judgeMode === 'residual') {
+    if (klass.op === 'other') {
       const compiled = await compileEffects(
         ctx,
         exec.agent,
@@ -1193,7 +1188,7 @@ export function apply(ctx, config = {}) {
         // 就当成冲突 → 问人。这样即使模型编译撒谎，也只能骗到"两边都说无害"的情况。
         const textHint = MUTATION_HINT.test(String(effect.raw ?? ''));
         // agentFinal=on：编译器的结论只作为证据交给审查 agent，不再自己放行。
-        if (allRead && allInside && !compiled.residual && !textHint && cfg.judgeAutoAllow) {
+        if (allRead && allInside && !compiled.residual && !textHint ) {
           const compiledFact = 'effect compiler reads this call as read-only: '
             + compiled.ops.map((o) => `${o.op}(${o.targets.slice(0, 2).join(',') || '?'})`).join(' / ');
           if (cfg.agentFinal) {
@@ -1232,65 +1227,22 @@ export function apply(ctx, config = {}) {
     }
 
 
-    // 1.8 残余 LLM 判定（只处理"项目内、无引文"这一档）
-    if (cfg.judgeMode === 'residual') {
-      const judgement = await judgeResidual(
-        ctx,
-        exec.agent,
-        { tool: exec.name, args: exec.arguments, klass, effect, texts: collectInstructionTexts(exec.agent) },
-        { timeoutMs: cfg.judgeTimeoutMs },
-      );
-      store.bump(sid, 'judge');
-      audit({
-        event: 'judge', sid, tool: exec.name, class: klass.key,
-        decision: judgement.decision, source: judgement.source, reason: judgement.reason,
-      });
-
-      if (judgement.decision === 'deny' && judgement.source === 'judge') {
-        store.bump(sid, 'deny');
-        store.deny(sid, klass.key);
-        return { kind: 'deny', reason: `capgate 复核拒绝：${judgement.reason || '超出用户授权范围'}` };
-      }
-
-      // LLM 复核只能"减问"，不能"放权"：
-      // 命中任何"锁死类别"（LOCKS）就绝不由复核放行；否则只允许它在
-      // 低风险层（项目内、非敏感、非批量、非出网、非不透明）直接放行。
-      //
-      // 例外（已废弃）：曾经允许"未知命令 + 文本里没有变更迹象"按纯读放行。
-      // 但 scancel / aws s3 rm / kubectl apply 这类命令一个删除动词都没有，
-      // 它们是**改名换姓的变更** —— 这个例外正是 cancel-jobs/artifacts 两族漏放的机制。
-      // 现在：认不出效果（unknown）就不许复核放权，必须问人。
-      const locks = locksOf(klass, effect);
-      const hardLocked = locks;
-      const judgeMayGrant = cfg.judgeAutoAllow
-        && !cfg.agentFinal   // agentFinal：复核也不许放权，只能给证据
-        && hardLocked.length === 0
-        && (process.env.CAPGATE_NO_TIER === '1' || klass.scope === 'workspace');
-      if (judgement.decision === 'allow' && judgeMayGrant) {
-        store.grant(sid, klass.key, { via: 'judge' });
-        store.bump(sid, 'grant');
-        store.bump(sid, 'judge'); audit({ event: 'grant', by: 'judge', sid, tool: exec.name, class: klass.key, reason: judgement.reason });
-        return next();
-      }
-      // agentFinal 下把复核意见带进审查者的证据里（"单次复核觉得是无害的"也是事实）
-      if (cfg.agentFinal && judgement.decision === 'allow' && exec.callId) {
-        const prev = citationByCall.get(String(exec.callId)) ?? [];
-        citationByCall.set(String(exec.callId), [...prev, 'a single-shot check judged this call harmless: ' + String(judgement.reason ?? '').slice(0, 160)]);
-        audit({ event: 'prior', by: 'judge', sid, tool: exec.name, class: klass.key });
-      }
-
+    // 1.8 没有引文、也不是只读：交给审查 agent 判。
+    //     以前这里先跑一次"单次复核"（judge），再问审查 agent；复核在 agentFinal 下已经不参与判定，
+    //     留着只是多一次模型调用和一层转述。现在直接问审查 agent —— 它是唯一判定者。
+    {
       store.rememberPending(sid, exec.callId, {
         key: klass.key, label, autoEligible: false, source: 'human', op: klass.op, opaque: !!effect.opaque,
       });
       store.bump(sid, 'ask');
       audit({
         event: 'ask', sid, tool: exec.name, class: klass.key,
-        autoEligible: false, opaque: !!effect.opaque, why: `judge:${judgement.decision}:${judgement.reason}`,
+        autoEligible: false, opaque: !!effect.opaque, why: 'reviewer-pending',
       });
       const whyNotGrant = klass.op === 'send' ? '出网需要你确认'
         : effect.opaque ? '不透明执行（脚本/解释器）需要你确认'
         : '需要你确认';
-      const judgeReview = await askViaVerifier(exec, { label, klass, effect, reason: judgement.reason, cwd });
+      const judgeReview = await askViaVerifier(exec, { label, klass, effect, reason: label, cwd });
       if (judgeReview?.verdict === 'deny' || judgeReview?.dataClass === 'credential' || judgeReview?.consistency === 'mismatch') {
         store.bump(sid, 'deny');
         audit({ event: 'deny', by: 'verifier-ask', sid, tool: exec.name, class: klass.key, reason: judgeReview.text });
@@ -1306,9 +1258,7 @@ export function apply(ctx, config = {}) {
         exec.agent,
         askDecision(
           judgeReview?.text
-            ?? (judgement.decision === 'allow'
-              ? `capgate: 首次使用「${label}」，复核认为符合要求，但${whyNotGrant}（${judgement.reason}）`
-              : `capgate: 首次使用「${label}」，复核认为不确定（${judgement.reason}）`),
+            ?? `capgate: 首次使用「${label}」，审查 agent 没有给出结论，${whyNotGrant}`,
           label,
           judgeReview ? { en: judgeReview.text, zh: judgeReview.text } : undefined,
         ),
@@ -1630,7 +1580,7 @@ export function apply(ctx, config = {}) {
         const body = [
           `mode=${mode()} preset=${preset ?? '(unknown)'}${cfg.requiredPreset ? `(需要 ${cfg.requiredPreset})` : ''}`
             + ` active=${active(invocation.agent) ? 'yes' : 'NO — 本档不接管'}`,
-          `judge=${cfg.judgeMode}${cfg.judgeAutoAllow ? '(auto-allow)' : ''} verify=${cfg.verifyMode}`,
+          `uptime: ${Math.round(process.uptime())}s`,
           `counters: allow=${stats.allow} ask=${stats.ask} deny=${stats.deny} grant=${stats.grant} judge=${judged}`,
           `短路来源: 证明式只读=${stats.proof ?? 0} 引文=${stats.citation ?? 0} 复用(类/范围/同命令)=${stats.reuse ?? 0} 规则=${stats.rule ?? 0}`,
           `LLM 节省率: ${saved}%（${shorted}/${total}，未省 ${judged} 次）`,
@@ -1737,6 +1687,6 @@ export function apply(ctx, config = {}) {
 
   for (const err of rules.errors) console.warn('[capgate] rule ignored:', err);
   console.log(`[capgate] active mode=${mode()} preset=${cfg.requiredPreset || '(any)'} `
-    + `judge=${cfg.judgeMode}${cfg.judgeAutoAllow ? '(auto)' : ''} `
+    
     + `rules=${rules.allowTools.length + rules.denyTools.length + rules.denyKeywords.length + rules.allowPaths.length + rules.denyPaths.length}`);
 }

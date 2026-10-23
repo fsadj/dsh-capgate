@@ -61,7 +61,7 @@ test('无引文的项目内操作 → 问人；人同意后同类**仍由 agent 
   const h = harness('跑一下测试', { judgeMode: 'off' });
   const first = await h.call('delete', { path: 'src/legacy.js' });
   assert.equal(first.decision.kind, 'ask');
-  assert.match(first.decision.reason, /未找到用户原话依据/);
+  assert.match(first.decision.reason, /审查 agent|未找到用户原话依据/);
 
   await h.approve(first.callId, 'allowed-once');
   // 同一类、不同目标：不再机械放行（这正是一次批准变成许可证的路径）
