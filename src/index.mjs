@@ -607,6 +607,29 @@ export function apply(ctx, config = {}) {
   }
 
   ctx.on('tools/pre-execute', async (exec, next) => {
+    const decision = await decideCall(exec, next);
+    // 统一记一条判定流水：口径分析（误报 vs 请示）需要"决策 + 目标"这一段。
+    try {
+      if (decision && decision.kind !== 'cancel' && exec?.agent && active(exec.agent)) {
+        const c = classOfCall(exec.agent, exec.name, exec.arguments);
+        if (c) {
+          audit({
+            event: 'decision',
+            sid: sidOf(exec.agent),
+            tool: exec.name,
+            kind: decision.kind,
+            by: decision.by ?? decision.reason ?? '',
+            class: c.klass?.key,
+            targets: (c.effect?.targets ?? []).map((t) => `${t.kind}:${t.value}`),
+            cardinality: cardinalityOf(c.effect),
+          });
+        }
+      }
+    } catch { /* 记流水失败不影响判定 */ }
+    return decision;
+  }, { prepend: true });
+
+  async function decideCall(exec, next) {
     if (!exec.agent) return next();
     if (!active(exec.agent)) {
       noteDormant(exec.agent, exec.name);
@@ -1200,7 +1223,7 @@ export function apply(ctx, config = {}) {
       ),
       label,
     );
-  }, { prepend: true });
+  }
 
   // ---- 2. 结果侧最小化：控制 agent 能看到多少 ----
   // 动作侧最小化只能管"能不能做"，数据最小化的另一半是"看到多少"。
