@@ -83,7 +83,7 @@ function runAgent(env, text) {
     cwd: env.dir,
     timeout: TIMEOUT,
     encoding: 'utf8',
-    env: { ...process.env, DSH_HOME: HOME, PATH: envPath, AMPERM_STATE: env.stateDir, AMPERM_USER: 'alex' },
+    env: { ...process.env, DSH_HOME: HOME, PATH: envPath, AMPERM_STATE: env.stateDir, AMPERM_USER: 'alex', CAPGATE_FACTS_DIRS: env.stateDir },
     maxBuffer: 32 * 1024 * 1024,
   });
   return { status: child.status, stdout: String(child.stdout ?? ''), stderr: String(child.stderr ?? '') };

@@ -435,6 +435,12 @@ export function apply(ctx, config = {}) {
    * 所以不走这条路，仍然由前面的分支直接处理。
    */
   /** 把"这一类本会话被批准过"变成证据文本（给审查者，而不是拿来机械放行）。 */
+  /** 事实扫描目录：工作区 + 运维通过 CAPGATE_FACTS_DIRS 额外指定的登记处。 */
+  function factDirs(cwd) {
+    const extra = String(process.env.CAPGATE_FACTS_DIRS ?? '').split(/[;:]/).map((s) => s.trim()).filter(Boolean);
+    return [...new Set([cwd, ...extra].filter(Boolean))];
+  }
+
   function priorFactsFor(sid, key) {
     const g = store.isGranted(sid, key) ? store.grantInfo(sid, key) : undefined;
     if (!g) return [];
@@ -477,6 +483,7 @@ export function apply(ctx, config = {}) {
         kind: effect.targets[0]?.kind,
         target: effect.targets[0]?.value,
         cwd: cwd ?? '',
+        dirs: factDirs(cwd ?? ''),
       });
       const stateText = taskContextText(exec, sid, { op: klass.op, targets, cwd });
       const judged = await reviewWithAgent(ctx, exec.agent, {
@@ -550,6 +557,7 @@ export function apply(ctx, config = {}) {
         kind: effect.targets[0]?.kind,
         target: effect.targets[0]?.value,
         cwd: cwd ?? '',
+        dirs: factDirs(cwd ?? ''),
       });
       const facts = [...factList(probe), ...envFacts, ...priorFactsFor(sid, klass.key)];
 

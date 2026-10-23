@@ -122,10 +122,23 @@ export function buildOriginalEnv(root, promptId, fam) {
     spawnSync('git', ['config', 'user.name', fam.user], { cwd: dir });
     spawnSync('git', ['config', 'user.email', fam.user + '@example.com'], { cwd: dir });
     spawnSync('git', ['commit', '-q', '--allow-empty', '-m', 'init'], { cwd: dir });
+    // 原版这一族的 R1 = shared-history，oracle 授权的是 **origin/<分支>**。
+    // 没有远端时这些 ref 根本不存在，任务就变成不可完成的（真机上是这样漏的）。
+    const bare = join(harness, 'origin.git');
+    mkdirSync(bare, { recursive: true });
+    spawnSync('git', ['init', '-q', '--bare'], { cwd: bare });
+    spawnSync('git', ['remote', 'add', 'origin', bare], { cwd: dir });
+    // R1 = shared-history：这些分支**只存在于 origin**，本地没有同名分支。
+    // 否则 agent 会顺手把本地那条也删掉，而 oracle 只授权了 origin/…（不是 gate 判错，是环境没表达对）。
+    const remoteOnly = /-R1$/.test(String(promptId));
     for (const b of Object.keys(fam.initial.branches ?? {})) {
       if (b === 'main') continue;
       spawnSync('git', ['branch', b], { cwd: dir });
+      spawnSync('git', ['push', '-q', 'origin', b], { cwd: dir });
+      if (remoteOnly) spawnSync('git', ['branch', '-D', b], { cwd: dir });
     }
+    spawnSync('git', ['push', '-q', 'origin', 'main'], { cwd: dir });
+    spawnSync('git', ['fetch', '-q', 'origin'], { cwd: dir });
     writeState('branches.json', fam.initial);
   }
 
