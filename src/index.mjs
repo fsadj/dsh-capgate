@@ -26,6 +26,7 @@ import { effectFingerprint } from './bypass.mjs';
 import { discover } from './discover.mjs';
 import { classifyAsk, askKindLabel } from './askreason.mjs';
 import { splitDecision, narrowedCommand } from './split.mjs';
+import { runProbe } from './probe.mjs';
 import { chooseView, applyView } from './outputview.mjs';
 import { buildTaskState, relationOf, renderTaskState } from './taskstate.mjs';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
@@ -69,6 +70,7 @@ export const DEFAULTS = {
   coverageMode: 'on',
   readGate: 'shadow',
   readGateSample: 15,
+  agentFinal: false,
   reviewerMode: 'agent',
   benchOut: '',
   blastLimit: 1000,
@@ -112,6 +114,7 @@ export const Config = Schema.object({
   verifierAsk: Schema.union(['off', 'on']).default('on').description('询问时由独立 verifier 生成四段式问题（只能收紧）'),
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
+  agentFinal: Schema.boolean().default(false).description('把所有变更类判定交给审查 agent（引文只作为证据，不再直接放行）'),
   readGateSample: Schema.number().default(15).description('shadow 模式抽样比例（%），降低语义复核开销'),
   readGate: Schema.union(['off', 'shadow', 'on']).default('shadow').description('读闸门：shadow=只记录词法与语义是否一致；on=语义不同意就不放行'),
   outputMinimize: Schema.union(['off', 'on']).default('on').description('结果侧最小化：对工具返回做裁剪与脱敏'),
@@ -441,6 +444,12 @@ export function apply(ctx, config = {}) {
     return [...new Set([cwd, ...extra].filter(Boolean))];
   }
 
+  /** 每次调用的引文证据（供审查者用；放在闭包里按 callId 取，避免作用域问题）。 */
+  const citationByCall = new Map();
+  function citationFactsOf(callId) {
+    return citationByCall.get(String(callId)) ?? [];
+  }
+
   function priorFactsFor(sid, key) {
     const g = store.isGranted(sid, key) ? store.grantInfo(sid, key) : undefined;
     if (!g) return [];
@@ -492,7 +501,8 @@ export function apply(ctx, config = {}) {
         op: klass.op,
         targets,
         locks,
-        facts: [...factList(probe), ...envFacts, ...priorFactsFor(sid, klass.key)],
+        facts: [...factList(probe), ...envFacts, ...priorFactsFor(sid, klass.key), ...citationFactsOf(exec.callId)],
+        __auditFacts: (f) => audit({ event: 'review_facts', sid, tool: exec.name, class: klass.key, n: f.length, sample: f.filter((x) => /record in /.test(x)).slice(0, 2) }),
         instructions,
         turns,
         state: stateText,
@@ -559,7 +569,7 @@ export function apply(ctx, config = {}) {
         cwd: cwd ?? '',
         dirs: factDirs(cwd ?? ''),
       });
-      const facts = [...factList(probe), ...envFacts, ...priorFactsFor(sid, klass.key)];
+      const facts = [...factList(probe), ...envFacts, ...priorFactsFor(sidOf(exec.agent), klass.key), ...citationFactsOf(exec.callId)];
 
       // 优先让独立审查 agent 来判（它有自己的上下文和只读工具）；
       // 不可用/失败时退回单次提示词审查。
@@ -573,7 +583,7 @@ export function apply(ctx, config = {}) {
           facts,
           instructions,
           turns,
-          state: taskContextText(exec, sid, { op: klass.op, targets, cwd }),
+          state: taskContextText(exec, sidOf(exec.agent), { op: klass.op, targets, cwd }),
           style: cfg.authStyle,
           customScope: cfg.customScope,
         style: cfg.authStyle,
@@ -984,7 +994,14 @@ export function apply(ctx, config = {}) {
 
     // 1.6 引文核对：对上就直接授予并放行（不经审批面）
     const evidence = evidenceFor(exec.agent, klass, effect, { allowOpaque: scriptInfo?.kind === 'ok' });
+    // agentFinal=on：引文不算判决，只算证据。判定交给审查 agent。
+    const citationFacts = [];
+    if (exec.callId) citationByCall.set(String(exec.callId), citationFacts);
     if (evidence.ok) {
+      const quoted = String(evidence.primary?.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 200);
+      citationFacts.push('user words that appear to authorize this call: "' + quoted + '"');
+    }
+    if (evidence.ok && !cfg.agentFinal) {
       if (scriptInfo?.kind === 'ok') {
         // 脚本可读：只记签名（同一条命令复用时不再问），不授予整个类
         store.approveSignature(sid, signature);
@@ -1019,7 +1036,7 @@ export function apply(ctx, config = {}) {
     // 1.6b 语义引文：原文没逐字提到，但模型从原话里抽出的契约条目覆盖了这次调用。
     //      只在"没有锁死类别"时生效——批量/出网/不透明/提权/未知仍然必须问人。
     //      抽取失败的语义（residual / 无 span）一律不算授权（fail-closed）。
-    if (!evidence.ok && cfg.intentMode === 'on' && klass.op !== 'other') {
+    if (!evidence.ok && cfg.intentMode === 'on' && klass.op !== 'other' && !cfg.agentFinal) {
       const locksNow = locksOf(klass, effect);
       if (locksNow.length === 0 || (locksNow.length === 1 && locksNow[0] === 'unknown')) {
         try {
@@ -1227,14 +1244,12 @@ export function apply(ctx, config = {}) {
       // 命中任何"锁死类别"（LOCKS）就绝不由复核放行；否则只允许它在
       // 低风险层（项目内、非敏感、非批量、非出网、非不透明）直接放行。
       //
-      // 例外（压 ask）：shell 里的"未知命令"，如果复核说 allow **且**命令文本里
-      // 没有任何变更迹象，就按纯读处理。两路独立意见都无害才放行。
-      const shellUnknownButClean = SHELL_TOOLS.has(exec.name)
-        && klass.op === 'other'
-        && !MUTATION_HINT.test(String(effect.raw ?? ''));
-
+      // 例外（已废弃）：曾经允许"未知命令 + 文本里没有变更迹象"按纯读放行。
+      // 但 scancel / aws s3 rm / kubectl apply 这类命令一个删除动词都没有，
+      // 它们是**改名换姓的变更** —— 这个例外正是 cancel-jobs/artifacts 两族漏放的机制。
+      // 现在：认不出效果（unknown）就不许复核放权，必须问人。
       const locks = locksOf(klass, effect);
-      const hardLocked = locks.filter((l) => l !== 'unknown' || !shellUnknownButClean);
+      const hardLocked = locks;
       const judgeMayGrant = cfg.judgeAutoAllow
         && hardLocked.length === 0
         && (process.env.CAPGATE_NO_TIER === '1' || klass.scope === 'workspace');
@@ -1685,6 +1700,50 @@ export function apply(ctx, config = {}) {
       console.log('[capgate] /capgate 命令已注册');
     } catch (err) {
       console.warn('[capgate] 命令注册失败:', err && err.message ? err.message : err);
+    }
+
+    // ---- 只读取证工具：给审查 agent 自己查的能力 ----
+    // 规则只做很轻的辅助（分类器认为只读，或命中只读子命令白名单），
+    // 真正"查什么、怎么判"交给 agent。主 agent 调用会被明确拒绝。
+    try {
+      const tools = ctx.get?.('tools') ?? ctx.tools;
+      if (tools?.register) {
+        tools.register({
+          name: 'capgate_probe',
+          description: 'Run ONE read-only command to gather evidence before judging a tool call '
+            + '(e.g. "git branch -a", "git status", "ls", "aws s3 ls", "kubectl get"). '
+            + 'Only available to the permission reviewer, never to the main agent. '
+            + 'No pipes, redirects or command chaining; 5s timeout; output truncated to 4KB.',
+          parameters: {
+            type: 'object',
+            properties: {
+              command: { type: 'string', description: 'a single read-only command' },
+              cwd: { type: 'string', description: 'working directory (defaults to the task workspace)' },
+            },
+            required: ['command'],
+            additionalProperties: false,
+          },
+          output: {
+            schema: { type: 'object', additionalProperties: true },
+            render: (args, value) => [{
+              type: 'text',
+              text: 'capgate_probe: ' + (value?.ok ? 'ok' : 'failed')
+                + (value?.why ? ' (' + value.why + ')' : '')
+                + '\n' + String(value?.stdout || ''.slice(0, 2000)),
+            }],
+          },
+          execute: async (args, exec) => {
+            const isSub = !!exec?.agent?.session?.parentSession;
+            if (!isSub) return { ok: false, why: 'capgate_probe is only available to the reviewer subagent' };
+            const out = runProbe(args, { defaultCwd: exec?.agent?.session?.header?.cwd ?? process.cwd() });
+            try { audit({ event: 'probe', command: String(args?.command ?? '').slice(0, 120), ok: out.ok, why: out.why }); } catch { /* ignore */ }
+            return out;
+          },
+        });
+        console.log('[capgate] 探针工具 capgate_probe 已注册');
+      }
+    } catch (err) {
+      console.warn('[capgate] 探针工具注册失败:', err && err.message ? err.message : err);
     }
   };
 

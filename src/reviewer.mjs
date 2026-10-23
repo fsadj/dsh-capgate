@@ -70,8 +70,8 @@ export function makeReviewSchema(allow = false) {
   };
 }
 
-/** 审查 agent 能用的工具：只有只读的四个 */
-export const REVIEW_TOOLS = ['read', 'glob', 'grep'];
+/** 审查 agent 能用的工具：读文件 + 只读取证探针。 */
+export const REVIEW_TOOLS = ['read', 'glob', 'grep', 'capgate_probe'];
 
 export function buildReviewPrompt(input, { allow = false } = {}) {
   const lines = [
@@ -102,6 +102,7 @@ export function buildReviewPrompt(input, { allow = false } = {}) {
     '- Naming a path or a thing is NOT a request to act on it. Without an action the user asked for, answer ask.',
     '- FACTS are environment evidence (identity, ownership, refs, remotes). Use them; if they do not settle whether the target belongs to the user, answer ask.',
     '- Ownership you cannot establish is a reason to ask, not a reason to allow.',
+    '- You may run ONE read-only command with capgate_probe to check a fact (e.g. git branch -a, git status, ls, aws s3 ls, kubectl get). Use it when a fact you need is missing; do not guess what you can check.',
     '- Put a strictly narrower alternative in alternatives when the call is too broad (less data, fewer files, or a dry run).',
     '',
     'TOOL: ' + input.tool,
