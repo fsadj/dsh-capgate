@@ -24,6 +24,7 @@ import { absoluteDanger, resolveEffect, loadShapeCache, flushShapeCache } from '
 import { reviewWithAgent, loadReviewCache, flushReviewCache, checkCoverage } from './reviewer.mjs';
 import { effectFingerprint } from './bypass.mjs';
 import { discover } from './discover.mjs';
+import { classifyAsk, askKindLabel } from './askreason.mjs';
 import { chooseView, applyView } from './outputview.mjs';
 import { buildTaskState, relationOf, renderTaskState } from './taskstate.mjs';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
@@ -299,14 +300,30 @@ export function apply(ctx, config = {}) {
     return { ok: true, citations, primary };
   }
 
-  const askDecision = (reason, label, display) => ({
-    kind: 'ask',
-    reason,
-    displayReason: display ?? {
-      en: `capgate: ${label}. Needs your decision.`,
-      zh: `capgate：${label}。需要你确认。`,
-    },
-  });
+  /**
+   * 询问判定。kind 区分三种原因，便于看板与优化：
+   *   impact   影响面（批量/通配/出网/提权）
+   *   referent 目标没点名
+   *   anomaly  目标看起来不对
+   */
+  const askDecision = (reason, label, display, meta = {}) => {
+    const askKind = meta.kind ?? classifyAsk({
+      cardinality: meta.cardinality,
+      locks: meta.locks,
+      wildcard: meta.wildcard,
+      text: reason,
+    });
+    const tag = askKindLabel(askKind);
+    return {
+      kind: 'ask',
+      askKind,
+      reason,
+      displayReason: display ?? {
+        en: `capgate: ${label} (${tag.en}). Needs your decision.`,
+        zh: `capgate：${label}（${tag.zh}）。需要你确认。`,
+      },
+    };
+  };
 
   function guardAsk(agent, decision, label) {
     if (decision.kind !== 'ask') return decision;
@@ -613,11 +630,22 @@ export function apply(ctx, config = {}) {
       if (decision && decision.kind !== 'cancel' && exec?.agent && active(exec.agent)) {
         const c = classOfCall(exec.agent, exec.name, exec.arguments);
         if (c) {
+          // ask 的原因按**这一类调用的性质**再校准一次：
+          // 批量/通配/带锁就是影响面，不管提示词怎么措辞。
+          if (decision.kind === 'ask') {
+            decision.askKind = classifyAsk({
+              cardinality: cardinalityOf(c.effect),
+              locks: locksOf(c.klass, c.effect),
+              wildcard: c.effect?.wildcard,
+              text: decision.reason,
+            });
+          }
           audit({
             event: 'decision',
             sid: sidOf(exec.agent),
             tool: exec.name,
             kind: decision.kind,
+            askKind: decision.askKind,
             by: decision.by ?? decision.reason ?? '',
             class: c.klass?.key,
             targets: (c.effect?.targets ?? []).map((t) => `${t.kind}:${t.value}`),

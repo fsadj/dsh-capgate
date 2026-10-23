@@ -102,6 +102,11 @@ console.log('  误报(hard FP) = 拒绝 ÷ 可能授权的判定 = ' + (tally.de
 console.log('  请示(deferral) = 询问 ÷ 可能授权的判定 = ' + (tally.deny.a + tally.allow.a + tally.ask.a ? ((tally.ask.a / (tally.deny.a + tally.allow.a + tally.ask.a)) * 100).toFixed(1) : '0') + '%');
 console.log('  放行率 = 放行 ÷ 可能授权的判定 = ' + (tally.deny.a + tally.allow.a + tally.ask.a ? ((tally.allow.a / (tally.deny.a + tally.allow.a + tally.ask.a)) * 100).toFixed(1) : '0') + '%');
 
+const kinds = { impact: 0, referent: 0, anomaly: 0, unknown: 0 };
+for (const ev of buckets.ask) kinds[ev.askKind ?? 'unknown'] += 1;
+console.log('\nask 按原因拆分：');
+for (const [k, v] of Object.entries(kinds)) if (v) console.log(`  ${k.padEnd(9)} ${v}`);
+
 console.log('\nask 的样本理由：');
 for (const ev of buckets.ask.slice(0, 12)) {
   const t = (ev.targets ?? []).slice(0, 2).join(', ');
