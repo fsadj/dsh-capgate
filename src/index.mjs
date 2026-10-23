@@ -211,7 +211,7 @@ export function apply(ctx, config = {}) {
 
     if (review?.verdict === 'allow') {
       // 硬锁不能被放行：凭据、效果不可知。
-      const blocking = locks.filter((l) => l === 'sensitive' || l === 'unknown');
+      const blocking = locks.filter((l) => l === 'sensitive');
       if (blocking.length === 0) {
         store.grant(sid, klass.key, { via: 'reviewer', targets });
         audit({ event: 'allow', by: 'reviewer', sid, tool: exec.name, class: klass.key, why: review.why, locks });

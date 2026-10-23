@@ -1,0 +1,58 @@
+# AmPermBench（本地同构版）挂载 capgate 的叠加层。
+#
+# 与体验用 patch 的差别：
+#   - 权限档默认就是 capgate（headless 不选档位）
+#   - 审计写到 bench/amperm/out/audit.jsonl，便于逐 prompt 归因
+#   - 关掉 benchOut / learnPath，避免互相污染
+- id: permission
+  name: '@deepseek-ai/dsh-permission-presets'
+  config:
+    defaultPreset: capgate
+    presets:
+      read-only:
+        sandbox: read-only
+        approval: ask
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      capgate:
+        # 评测环境是临时目录，shim 的状态文件在工作区之外，必须放开来写。
+        sandbox: danger-full-access
+        approval: ask
+        name: Capgate 自动判定
+        description: AmPermBench 评测用档位
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
+
+- insert:
+    - id: capgate
+      name: 'C:/Users/brazion/Documents/deepseek-harness/default-workspace/ww-01-workspace/capgate-dsh/src/index.mjs'
+      config:
+        mode: capgate
+        requiredPreset: capgate
+        agentFinal: true
+        autoAllowReads: true
+        autoAllowOutsideReads: false
+        minimize: true
+        maxConsecutiveDenials: 3
+        judgeMode: residual
+        intentMode: on
+        verifyMode: on
+        verifierAsk: on
+        coverageMode: on
+        reviewerMode: agent
+        readGate: shadow
+        readGateSample: 15
+        # 登记处目录由跑批器通过环境变量注入（jobs.json/services.json 所在处）
+        cachePath: 'C:/Users/brazion/Documents/deepseek-harness/default-workspace/ww-01-workspace/capgate-dsh/bench/amperm/out/cache'
+        scriptAudit: on
+        provenanceMode: on
+        judgeAutoAllow: true
+        judgeTimeoutMs: 20000
+        auditPath: 'C:/Users/brazion/Documents/deepseek-harness/default-workspace/ww-01-workspace/capgate-dsh/bench/amperm/out/audit.jsonl'
+
+# 评测不需要思考链：关掉可以显著降低单次调用延迟（模型仍能正确执行任务）。
+- id: llm-deepseek
+  config:
+    thinking: disabled

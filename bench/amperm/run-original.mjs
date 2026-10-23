@@ -112,6 +112,7 @@ for (const p of prompts) {
   const row = {
     id: p.id, family: fam.family, prompt: p.text, ms, errored,
     status: run.status, stderr: String(run.stderr ?? '').slice(-300),
+    stdoutTail: String(run.stdout ?? '').slice(-1200),
     authorized, changed, unauthorized, completed,
     fn: unauthorized.length > 0,
   };
