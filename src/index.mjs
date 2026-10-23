@@ -433,6 +433,18 @@ export function apply(ctx, config = {}) {
    * sensitive（凭据）与 unknown（效果不可知）缺的是事实，任何引文都补不上，
    * 所以不走这条路，仍然由前面的分支直接处理。
    */
+  /** 把"这一类本会话被批准过"变成证据文本（给审查者，而不是拿来机械放行）。 */
+  function priorFactsFor(sid, key) {
+    const g = store.isGranted(sid, key) ? store.grantInfo(sid, key) : undefined;
+    if (!g) return [];
+    return [
+      'already approved this session for class ' + key
+      + ': targets=' + ((g.targets ?? []).join(', ') || '(not recorded)')
+      + '; via ' + (g.via ?? 'human'),
+      ...(g.citation ? ['approval citation: ' + g.citation] : []),
+    ];
+  }
+
   async function trySemanticClear(exec, { klass, effect, locks, sid, cwd }) {
     if (cfg.coverageMode !== 'on') return undefined;
     const CLEARABLE = new Set(['batch', 'egress', 'opaque', 'privilege']);
@@ -472,7 +484,7 @@ export function apply(ctx, config = {}) {
         op: klass.op,
         targets,
         locks,
-        facts: [...factList(probe), ...envFacts],
+        facts: [...factList(probe), ...envFacts, ...priorFactsFor(sid, klass.key)],
         instructions,
         turns,
         state: stateText,
@@ -538,7 +550,7 @@ export function apply(ctx, config = {}) {
         target: effect.targets[0]?.value,
         cwd: cwd ?? '',
       });
-      const facts = [...factList(probe), ...envFacts];
+      const facts = [...factList(probe), ...envFacts, ...priorFactsFor(sid, klass.key)];
 
       // 优先让独立审查 agent 来判（它有自己的上下文和只读工具）；
       // 不可用/失败时退回单次提示词审查。
@@ -855,11 +867,21 @@ export function apply(ctx, config = {}) {
       }
     }
 
-    // 1.4 已授予的类
-    if (store.isGranted(sid, klass.key)) {
-      store.bump(sid, 'allow');
-      store.bump(sid, 'reuse'); audit({ event: 'allow', by: 'class-grant', sid, tool: exec.name, class: klass.key });
-      return next();
+    // 1.4 已授予的类：**不再机械放行**，改成把"这一类之前被批准过"当成证据交给审查者。
+    //     机械放行等于把一次批准扩散成一张许可证；而"这次的目标还算不算同类"
+    //     恰恰是模型比分类键更会判的东西（比如同是 delete，别人的分支就不该算）。
+    //     批量的批准本来就不落到类上（perAction），所以这里不会放宽批量。
+    const priorGrant = store.isGranted(sid, klass.key) ? store.grantInfo(sid, klass.key) : undefined;
+    const priorFacts = priorGrant
+      ? [
+        'already approved this session for class ' + klass.key
+        + ': targets=' + ((priorGrant.targets ?? []).join(', ') || '(not recorded)')
+        + '; via ' + (priorGrant.via ?? 'human'),
+        ...(priorGrant.citation ? ['approval citation: ' + priorGrant.citation] : []),
+      ]
+      : [];
+    if (priorGrant) {
+      audit({ event: 'prior', sid, tool: exec.name, class: klass.key, targets: (priorGrant.targets ?? []).slice(0, 5) });
     }
 
     // 1.5 批量/通配：先让判断方带引文解释"用户是不是明说了这个范围"。

@@ -57,15 +57,19 @@ test('首次写带引文 → 直接授予放行（不经过审批面）；同类
   assert.equal(second.decision.kind, 'allow', '同一效果类（项目内写·单目标）应免打扰');
 });
 
-test('无引文的项目内操作 → 问人；人同意后同类放行', async () => {
+test('无引文的项目内操作 → 问人；人同意后同类**仍由 agent 判**（无 agent 则继续问）', async () => {
   const h = harness('跑一下测试', { judgeMode: 'off' });
   const first = await h.call('delete', { path: 'src/legacy.js' });
   assert.equal(first.decision.kind, 'ask');
   assert.match(first.decision.reason, /未找到用户原话依据/);
 
   await h.approve(first.callId, 'allowed-once');
+  // 同一类、不同目标：不再机械放行（这正是一次批准变成许可证的路径）
   const second = await h.call('delete', { path: 'src/old.js' });
-  assert.equal(second.decision.kind, 'allow');
+  assert.equal(second.decision.kind, 'ask');
+  // 但完全相同的目标仍在已批准范围内 → 放行
+  const third = await h.call('delete', { path: 'src/legacy.js' });
+  assert.equal(third.decision.kind, 'allow');
 });
 
 test('人拒绝后同类不再放行', async () => {

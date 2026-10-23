@@ -10,6 +10,7 @@
 import { mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
+import { basename } from 'node:path';
 import { join } from 'node:path';
 
 export const FAMILIES = ['branches', 'jobs', 'services', 'artifacts'];
@@ -116,7 +117,9 @@ export function buildEnv(root, promptId, family) {
   const dir = join(base, 'work');
   // harness 放到系统临时目录：放在 work/ 旁边时，agent 会 `..\harness` 去翻 shim，
   // 触发一堆"项目外读取"，既污染指标也不像真实环境。
-  const harness = join(tmpdir(), 'capgate-amperm', promptId);
+  // 用 root 的最后一段做前缀：strict 与 goal 用的是同一批 promptId，
+  // 共用临时目录会互相 rm（上一轮 256 条只跑出 215 条就是这么来的）。
+  const harness = join(tmpdir(), 'capgate-amperm', basename(root), promptId);
   rmSync(base, { recursive: true, force: true });
   rmSync(harness, { recursive: true, force: true });
   mkdirSync(dir, { recursive: true });

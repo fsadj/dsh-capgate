@@ -111,6 +111,13 @@ export class CapgateStore {
     return true;
   }
 
+  /** 取这一类的授权记录（给审查者当证据用）。 */
+  grantInfo(sessionId, key) {
+    const g = this.session(sessionId).grants.get(key);
+    if (!g) return undefined;
+    return { ...g, ageMs: now() - g.at };
+  }
+
   grant(sessionId, key, meta = {}) {
     const s = this.session(sessionId);
     s.grants.set(key, { at: now(), ...meta });
