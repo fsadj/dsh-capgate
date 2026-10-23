@@ -18,7 +18,7 @@ import { effectOf, effectOfSchema, classify, describeClass, cardinalityOf, locks
 import { absoluteDanger } from './effects.mjs';
 import { reviewWithAgent, loadReviewCache, flushReviewCache } from './reviewer.mjs';
 import { discover } from './discover.mjs';
-import { runProbe } from './probe.mjs';
+import { runProbe, readOnlyCommand } from './probe.mjs';
 import { compileRules } from './rules.mjs';
 import { CapgateStore } from './store.mjs';
 import { chooseView, applyView } from './outputview.mjs';

@@ -26,6 +26,11 @@ const READONLY_SUBCOMMAND = new RegExp(
 const TIMEOUT_MS = 5000;
 const MAX_OUTPUT = 4000;
 
+/** 这条命令是否命中"已知只读子命令"白名单（主判定链复用）。 */
+export function readOnlyCommand(text) {
+  return READONLY_SUBCOMMAND.test(String(text ?? "").trim());
+}
+
 /** 这条命令能不能当探针执行？返回 {ok, why} */
 export function probeAllowed(command) {
   const text = String(command ?? '').trim();
