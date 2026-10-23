@@ -1209,10 +1209,21 @@ export function apply(ctx, config = {}) {
         // 两路独立意见取更严：编译说"纯读"，但如果命令文本里出现任何变更迹象，
         // 就当成冲突 → 问人。这样即使模型编译撒谎，也只能骗到"两边都说无害"的情况。
         const textHint = MUTATION_HINT.test(String(effect.raw ?? ''));
+        // agentFinal=on：编译器的结论只作为证据交给审查 agent，不再自己放行。
         if (allRead && allInside && !compiled.residual && !textHint && cfg.judgeAutoAllow) {
-          store.bump(sid, 'allow');
-          audit({ event: 'allow', by: 'compiled-read', sid, tool: exec.name, class: klass.key });
-          return next();
+          const compiledFact = 'effect compiler reads this call as read-only: '
+            + compiled.ops.map((o) => `${o.op}(${o.targets.slice(0, 2).join(',') || '?'})`).join(' / ');
+          if (cfg.agentFinal) {
+            if (exec.callId) {
+              const prev = citationByCall.get(String(exec.callId)) ?? [];
+              citationByCall.set(String(exec.callId), [...prev, compiledFact]);
+            }
+            audit({ event: 'prior', by: 'compiled-read', sid, tool: exec.name, class: klass.key });
+          } else {
+            store.bump(sid, 'allow');
+            audit({ event: 'allow', by: 'compiled-read', sid, tool: exec.name, class: klass.key });
+            return next();
+          }
         }
 
         // 编译出"项目内写/执行"或无法完全解析 → 问人，但把编译结果放进卡片
@@ -1269,6 +1280,7 @@ export function apply(ctx, config = {}) {
       const locks = locksOf(klass, effect);
       const hardLocked = locks;
       const judgeMayGrant = cfg.judgeAutoAllow
+        && !cfg.agentFinal   // agentFinal：复核也不许放权，只能给证据
         && hardLocked.length === 0
         && (process.env.CAPGATE_NO_TIER === '1' || klass.scope === 'workspace');
       if (judgement.decision === 'allow' && judgeMayGrant) {
@@ -1276,6 +1288,12 @@ export function apply(ctx, config = {}) {
         store.bump(sid, 'grant');
         store.bump(sid, 'judge'); audit({ event: 'grant', by: 'judge', sid, tool: exec.name, class: klass.key, reason: judgement.reason });
         return next();
+      }
+      // agentFinal 下把复核意见带进审查者的证据里（"单次复核觉得是无害的"也是事实）
+      if (cfg.agentFinal && judgement.decision === 'allow' && exec.callId) {
+        const prev = citationByCall.get(String(exec.callId)) ?? [];
+        citationByCall.set(String(exec.callId), [...prev, 'a single-shot check judged this call harmless: ' + String(judgement.reason ?? '').slice(0, 160)]);
+        audit({ event: 'prior', by: 'judge', sid, tool: exec.name, class: klass.key });
       }
 
       store.rememberPending(sid, exec.callId, {
