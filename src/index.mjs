@@ -63,7 +63,6 @@ export function apply(ctx, config = {}) {
     allowTools: cfg.allowTools, denyTools: cfg.denyTools,
     allowPaths: cfg.allowPaths, denyPaths: cfg.denyPaths, denyKeywords: cfg.denyKeywords,
   });
-  const citationsByCall = new Map();
   const sigByCall = new Map();
 
   const mode = () => (cfg.mode === 'standard' ? 'standard' : 'capgate');
@@ -109,8 +108,6 @@ export function apply(ctx, config = {}) {
   }
 
   /** 影响面：这些锁只是"要说明理由"，不是否决权 */
-  const impactLocks = (locks) => locks.filter((l) => l === 'batch' || l === 'egress' || l === 'privilege' || l === 'opaque');
-
   /* ───────────── 判定 ───────────── */
 
   async function decideCall(exec, next) {
@@ -478,3 +475,4 @@ function evaluateRules(rules, { tool, effect }) {
   for (const p of rules.allowPaths) if (paths.some((x) => x.startsWith(p))) return { kind: 'allow', rule: 'allowPaths:' + p };
   return undefined;
 }
+
