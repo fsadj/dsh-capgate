@@ -23,6 +23,7 @@ import { judgeCoverage } from './coverage.mjs';
 import { absoluteDanger, resolveEffect, loadShapeCache, flushShapeCache } from './effects.mjs';
 import { reviewWithAgent, loadReviewCache, flushReviewCache, checkCoverage } from './reviewer.mjs';
 import { effectFingerprint } from './bypass.mjs';
+import { discover } from './discover.mjs';
 import { chooseView, applyView } from './outputview.mjs';
 import { buildTaskState, relationOf, renderTaskState } from './taskstate.mjs';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
@@ -65,6 +66,7 @@ export const DEFAULTS = {
   provenanceMode: 'on',
   coverageMode: 'on',
   readGate: 'shadow',
+  readGateSample: 15,
   reviewerMode: 'agent',
   benchOut: '',
   blastLimit: 1000,
@@ -108,6 +110,7 @@ export const Config = Schema.object({
   verifierAsk: Schema.union(['off', 'on']).default('on').description('询问时由独立 verifier 生成四段式问题（只能收紧）'),
   provenanceMode: Schema.union(['off', 'on']).default('on').description('来源事实：本任务内 agent 创建的文件，读写删不再反复询问'),
   coverageMode: Schema.union(['off', 'on']).default('on').description('覆盖判断：字面命中失败时，由模型判断目标是否落在授权内'),
+  readGateSample: Schema.number().default(15).description('shadow 模式抽样比例（%），降低语义复核开销'),
   readGate: Schema.union(['off', 'shadow', 'on']).default('shadow').description('读闸门：shadow=只记录词法与语义是否一致；on=语义不同意就不放行'),
   outputMinimize: Schema.union(['off', 'on']).default('on').description('结果侧最小化：对工具返回做裁剪与脱敏'),
   cachePath: Schema.string().default('').description('语义/判定缓存的落盘路径（空=仅内存）'),
@@ -130,6 +133,17 @@ export const Config = Schema.object({
 function readMode(value) {
   if (value && typeof value === 'object' && typeof value.get === 'function') return value.get();
   return value;
+}
+
+/** 稳定的小哈希，用来做确定性抽样（同一签名永远落到同一档）。 */
+function hash32(text) {
+  let h = 2166136261;
+  const s = String(text);
+  for (let i = 0; i < s.length; i += 1) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
 }
 
 /** shell 工具集合：效果在命令文本里，不按 schema 判。 */
@@ -428,6 +442,12 @@ export function apply(ctx, config = {}) {
       // 判断交给独立审查 agent：它可以自己枚举、抽样、看内容，然后给出语义结论。
       // 我们只把结论映射成动作。
       const probe = verify({ op: klass.op, targets }, { scope: { mode: cfg.verifierScope, root: cwd ?? '' } });
+      // 归属、身份、远端这类事实不写死成规则：从环境里取回来交给审查者自己判。
+      const envFacts = discover({
+        kind: effect.targets[0]?.kind,
+        target: effect.targets[0]?.value,
+        cwd: cwd ?? '',
+      });
       const stateText = taskContextText(exec, sid, { op: klass.op, targets, cwd });
       const judged = await reviewWithAgent(ctx, exec.agent, {
         tool: exec.name,
@@ -435,7 +455,7 @@ export function apply(ctx, config = {}) {
         op: klass.op,
         targets,
         locks,
-        facts: factList(probe),
+        facts: [...factList(probe), ...envFacts],
         instructions,
         turns,
         state: stateText,
@@ -495,7 +515,13 @@ export function apply(ctx, config = {}) {
       const targets = effect.targets.filter((t) => t.kind === 'path').map((t) => t.value);
 
       const probe = verify({ op: klass.op, targets }, { scope: { mode: cfg.verifierScope, root: cwd ?? '' } });
-      const facts = factList(probe);
+      // 归属、身份、远端这类事实不写死成规则：从环境里取回来交给审查者自己判。
+      const envFacts = discover({
+        kind: effect.targets[0]?.kind,
+        target: effect.targets[0]?.value,
+        cwd: cwd ?? '',
+      });
+      const facts = [...factList(probe), ...envFacts];
 
       // 优先让独立审查 agent 来判（它有自己的上下文和只读工具）；
       // 不可用/失败时退回单次提示词审查。

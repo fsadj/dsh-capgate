@@ -144,6 +144,30 @@ export function parseShell(command, cwd, depth = 0) {
   const PLAIN_QUERY = /^\s*(?:node|nodejs|python3?|deno|bun|ruby|perl|php|java|go|cargo|npm|pnpm|yarn|git|docker|kubectl|pwsh|powershell)\s+(?:--?v(?:ersion)?|--?h(?:elp)?)\s*;?\s*$/i;
   const plainQuery = !redirects && PLAIN_QUERY.test(text);
 
+  // git 的**引用删除**不是文件删除，更不是"执行"：
+  //   git branch -D <ref>   /  git push <remote> --delete <ref>
+  // 之前被当成 execute，于是目标被拼成 `C:/repo/bob/x` 这种假路径，
+  // 引用名里的 owner 前缀（bob/）在覆盖率判定里彻底丢了，
+  // 结果"清我的分支"把别人的分支也删了，而且 LLM 看到的是个路径而不是分支。
+  const GIT_BRANCH_DEL = /\bgit\s+branch\s+(?:-[a-zA-Z]*[dD][a-zA-Z]*|--delete)\s+([^\s;|&]+)/i.exec(text);
+  const GIT_PUSH_DEL = /\bgit\s+push\s+([^\s;|&]+)\s+(?:[^\s;|&]+\s+)*--delete\s+([^\s;|&]+)/i.exec(text);
+  const gitRefDeletes = [];
+  if (GIT_BRANCH_DEL) gitRefDeletes.push(GIT_BRANCH_DEL[1]);
+  if (GIT_PUSH_DEL) gitRefDeletes.push(GIT_PUSH_DEL[2]);
+  if (gitRefDeletes.length > 0) {
+    return {
+      op: 'delete',
+      targets: gitRefDeletes.map((r) => ({ kind: 'ref', value: String(r).replace(/^["']|["']$/g, '') })),
+      wildcard: gitRefDeletes.some((r) => /[*?]/.test(r)),
+      wrapped,
+      opaque: false,
+      elevated: false,
+      source: 'shell',
+      confidence: 'high',
+      raw: text.slice(0, 400),
+    };
+  }
+
   // 一个动词都没认出来 → **不许当读**。
   // 这是三次真实漏放的共同根因：`.NET API`、`robocopy /MOV`、`cmd /c del` 都因为
   // "没匹配到动词"退化成 read，然后被"项目外普通读"快路静默放行。

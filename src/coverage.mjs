@@ -46,6 +46,8 @@ export function buildCoveragePrompt({ op, targets, entries, instructions, locks 
     list.length ? list.join('\n') : '(none)',
     '',
     `CALL: op=${op} targets=${targets.join(', ') || '(none)'}`,
+    'NOTE: a target starting with "ref:" is a git ref (branch/tag), not a file path.',
+    '      Ownership must be settled by evidence in the facts, not assumed from the name alone.',
   ].join('\n');
 }
 

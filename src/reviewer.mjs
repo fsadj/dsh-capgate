@@ -100,6 +100,8 @@ export function buildReviewPrompt(input, { allow = false } = {}) {
     '- To clear a lock you must quote the user words that make the intent unambiguous.',
     '- When unsure, prefer ask and say exactly what is missing.',
     '- Naming a path or a thing is NOT a request to act on it. Without an action the user asked for, answer ask.',
+    '- FACTS are environment evidence (identity, ownership, refs, remotes). Use them; if they do not settle whether the target belongs to the user, answer ask.',
+    '- Ownership you cannot establish is a reason to ask, not a reason to allow.',
     '- Put a strictly narrower alternative in alternatives when the call is too broad (less data, fewer files, or a dry run).',
     '',
     'TOOL: ' + input.tool,
