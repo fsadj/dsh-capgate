@@ -1,5 +1,4 @@
 import { readFileSync, writeFileSync } from 'node:fs';
-import { classifyFailure, shouldRetry, FailureKind } from './failures.mjs';
 import { styleText } from './scope.mjs';
 /**
  * 审查 agent：让"承重"落在一个独立的 agent 个体上，而不是插件里的几次提示词调用。
@@ -286,9 +285,7 @@ async function attemptOnce(ctx, svc, name, input, { tools, allow, budget, agent 
     }
     return undefined;
   } catch (e) {
-    const kind = classifyFailure(e);
-    console.warn('[capgate] reviewer failed (' + kind + '): ' + (e && e.message ? e.message : e));
-    if (kind === FailureKind.TIMEOUT || shouldRetry(kind)) return undefined; // 交给外层重试
+    console.warn('[capgate] reviewer failed: ' + (e && e.message ? e.message : e));
     return undefined;
   } finally {
     clearTimeout(timer);

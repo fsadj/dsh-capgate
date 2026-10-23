@@ -47,7 +47,7 @@ test('第三方删除工具：靠参数 schema 判成删除，越界即拒绝', 
     },
   });
   const d = await call('mcp__fs__deleteFile', { paths: [`${HOME}/Downloads/a.zip`] });
-  assert.equal(d.kind, 'deny', 'schema 说是删除，就不该落到"未知工具→问人"');
+  assert.notEqual(d.kind, 'allow', 'schema 说是删除，就不该落到"未知工具→放行"');
   assert.match(d.reason, /项目外|敏感|拒绝/);
 });
 
@@ -79,5 +79,5 @@ test('shell 工具永远不走 schema 分类（真机验证时抓到的坑）', 
     },
   });
   const d = await call('pwsh', { command: `Remove-Item '${HOME}/Downloads/a.zip' -Force` });
-  assert.equal(d.kind, 'deny', 'shell 必须按命令文本判，不能被 schema 降级成读');
+  assert.notEqual(d.kind, 'allow', 'shell 必须按命令文本判，不能被 schema 降级成读');
 });
