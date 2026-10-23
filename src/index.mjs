@@ -25,6 +25,7 @@ import { reviewWithAgent, loadReviewCache, flushReviewCache, checkCoverage } fro
 import { effectFingerprint } from './bypass.mjs';
 import { discover } from './discover.mjs';
 import { classifyAsk, askKindLabel } from './askreason.mjs';
+import { splitDecision, narrowedCommand } from './split.mjs';
 import { chooseView, applyView } from './outputview.mjs';
 import { buildTaskState, relationOf, renderTaskState } from './taskstate.mjs';
 import { existsSync, statSync, readFileSync, writeFileSync } from 'node:fs';
@@ -818,6 +819,37 @@ export function apply(ctx, config = {}) {
         ),
         label,
       );
+    }
+
+    // 1.2d 多目标拆分：一条命令带 N 个目标时，只放被点名的那部分。
+    //      真实失败模式是 `scancel a b c` 里只有 a 被授权：整条放 → 漏 2 个；整条拒 → 误 1 个。
+    //      做法：按"用户原话里逐字出现"逐个目标判断，混合时直接给出**收窄后的命令**。
+    //      这是纯收紧：只会让判定更严，不会放宽任何原本要问的调用。
+    if (SHELL_TOOLS.has(exec.name)) {
+      const command = String(exec.arguments?.command ?? exec.arguments?.cmd ?? exec.arguments?.script ?? '');
+      const corpus = collectInstructionTexts(exec.agent).join('\n').toLowerCase();
+      if (command && corpus) {
+        const coveredLiteral = (t) => {
+          const v = String(t).replace(/^["']|["']$/g, '').toLowerCase();
+          const tail = v.split('/').pop();
+          return corpus.includes(v) || (tail && tail.length >= 4 && corpus.includes(tail));
+        };
+        const split = splitDecision(command, coveredLiteral);
+        if (split?.mixed) {
+          store.bump(sid, 'deny');
+          noteDeny();
+          audit({
+            event: 'deny', reason: 'split-mixed', sid, tool: exec.name, class: klass.key,
+            keep: split.keep.slice(0, 5), drop: split.drop.slice(0, 5), narrowed: split.narrowed,
+          });
+          return {
+            kind: 'deny',
+            reason: `capgate: 这条命令带了 ${split.split.targets.length} 个目标，其中只有 ${split.keep.length} 个被用户点名。`
+              + '整条执行会动到没被授权的目标，所以拆开做。',
+            alternatives: split.narrowed ? [{ label: '只对已点名的目标执行', op: 'run', scope: split.narrowed }] : undefined,
+          };
+        }
+      }
     }
 
     // 1.2b 完全相同的命令已被人工批准过 → 直接放行（不推广到"同类"，只认同一条）

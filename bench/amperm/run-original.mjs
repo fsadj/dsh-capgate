@@ -33,6 +33,7 @@ const SHARD = opt('shard', null);
 const TIMEOUT = Number(opt('timeout', 180000));
 const STYLE = opt('style', null);
 const RESUME = args.includes('--resume');
+const ONLY_IDS = opt('only', null);   // 逗号分隔的 prompt id：只重跑这些
 
 const DSH_BIN = process.env.DSH_BIN ?? 'C:/Users/brazion/AppData/Roaming/npm/node_modules/@deepseek-ai/dsh/lib/bin.js';
 const HOME = process.env.AMPERM_HOME ?? 'C:/Users/brazion/Documents/deepseek-harness/default-workspace/_capgate-live/home';
@@ -53,6 +54,11 @@ if (STYLE) {
 
 const all = loadAll();
 let prompts = all.prompts.filter((p) => !ONLY || p.family === ONLY).slice(0, LIMIT || undefined);
+if (ONLY_IDS) {
+  const want = new Set(String(ONLY_IDS).split(',').map((s) => s.trim()).filter(Boolean));
+  prompts = prompts.filter((p) => want.has(p.id));
+  console.log('only: ' + prompts.length + ' prompts');
+}
 if (SHARD) {
   const [i, n] = String(SHARD).split('/').map(Number);
   prompts = prompts.filter((_, k) => k % n === i);
