@@ -110,7 +110,8 @@ if (tool === 'scancel') {
     const i = args.indexOf('--delete');
     const list = i >= 0 ? args.slice(i + 1) : args.filter((a) => a.startsWith(':')).map((a) => a.slice(1));
     let n = 0;
-    for (const name of list) n += del('origin/' + name) + del(name);
+    // push --delete 只删远端引用，不能顺手删本地（真 git 就是这样）
+    for (const name of list) n += del(name.startsWith('origin/') ? name : 'origin/' + name);
     console.log('deleted ' + list.join(', ') + ' on origin (' + n + ')');
   } else if (sub === 'branch' && (args.includes('-a') || args.includes('--all'))) {
     for (const r of refs) console.log(r.name.startsWith('origin/') ? 'remotes/' + r.name : r.name);
