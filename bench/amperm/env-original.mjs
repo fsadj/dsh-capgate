@@ -45,7 +45,21 @@ if (tool === 'scancel') {
   for (const j of doc.jobs ?? []) console.log([j.job_id, j.owner, j.queue, j.status, j.stale ? 'stale' : ''].join('\t'));
 } else if (tool === 'aws' && args[0] === 's3' && args[1] === 'ls') {
   const doc = readJson('objects.json', { objects: [] });
-  for (const o of doc.objects ?? []) if (o.status === 'present') console.log(o.key + '\t' + o.object_id + '\t' + o.owner);
+  const target = args.slice(2).find((a) => a.startsWith('s3://'));
+  const prefix = target ? String(target).replace(/^s3:\/\//, '') : '';
+  for (const o of doc.objects ?? []) {
+    if (o.status !== 'present') continue;
+    if (prefix && !o.key.startsWith(prefix.replace(/\/+$/, ''))) continue;
+    console.log('2025-11-20 10:00:00   1048576 ' + o.key);
+  }
+} else if (tool === 'aws' && args[0] === 's3api' && args[1] === 'list-buckets') {
+  const doc = readJson('objects.json', { objects: [] });
+  const buckets = [...new Set((doc.objects ?? []).map((o) => o.key.split('/')[0]))];
+  console.log(JSON.stringify({ Buckets: buckets.map((b) => ({ Name: b })) }));
+} else if (tool === 'aws' && args[0] === 'sts') {
+  console.log(JSON.stringify({ UserId: 'AIDAEXAMPLE', Account: '123456789012', Arn: 'arn:aws:iam::123456789012:user/' + readJson('objects.json', {}).x }));
+} else if (tool === 'aws' && args[0] === 'configure') {
+  console.log('      Name                    Value\n      ----                    -----\n      region                  us-east-1');
 } else if (tool === 'aws' && args[0] === 's3api' && args[1] === 'list-objects') {
   const doc = readJson('objects.json', { objects: [] });
   console.log(JSON.stringify({ Contents: (doc.objects ?? []).filter((o) => o.status === 'present').map((o) => ({ Key: o.key, Size: 1024 })) }));
@@ -64,6 +78,8 @@ if (tool === 'scancel') {
 } else if (tool === 'kubectl' && (args[0] === 'get' || (args[0] === 'rollout' && args[1] === 'status'))) {
   const doc = readJson('services.json', { services: [] });
   for (const s of doc.services ?? []) console.log([s.service_id, s.name, s.env, s.health, s.owner, s.protected ? 'protected' : ''].join('\t'));
+} else if (tool === 'kubectl' && args[0] === 'config') {
+  console.log('workbench');
 } else if (tool === 'kubectl') {
   const doc = readJson('services.json', { services: [] });
   const svc = doc.services ?? [];
@@ -105,7 +121,7 @@ if (tool === 'scancel') {
   } else if (sub === 'show-ref') {
     for (const r of refs) console.log('0000000000000000000000000000000000000000 ' + (r.name.startsWith('origin/') ? 'refs/remotes/' + r.name : 'refs/heads/' + r.name));
   } else if (sub === 'for-each-ref') {
-    for (const r of refs) console.log(r.name);
+    for (const r of refs) console.log(r.name + '\t' + (r.owner || doc.user) + '\t' + (r.protected ? 'protected' : ''));
   } else if (sub === 'ls-remote') {
     for (const r of refs) if (r.name.startsWith('origin/')) console.log('0000000000000000000000000000000000000000\trefs/heads/' + r.name.replace(/^origin\//, ''));
   } else if (sub === 'remote' && args[1] === 'get-url') {
