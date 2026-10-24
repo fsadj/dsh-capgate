@@ -207,7 +207,12 @@ export function apply(ctx, config = {}) {
         return guardAsk(agent, askDecision('capgate: 「' + label + '」已连续被拒 ' + n + ' 次，转人工核对。', label, { locks }), label);
       }
       audit({ event: 'deny', by: 'reviewer', sid, tool: exec.name, class: klass.key, why: review.why });
-      return { kind: 'deny', reason: `capgate 复核拒绝：${review.why || review.text || '超出用户授权范围'}`, alternatives: review.alternatives };
+      return {
+        kind: 'deny',
+        reason: `capgate 复核拒绝：${review.why || review.text || '超出用户授权范围'}`,
+        // 拒绝时给一步可执行的下台阶：纯字符串收窄，不调模型
+        alternatives: review.alternatives ?? narrowerOptions(effect, targets),
+      };
     }
 
     if (review?.verdict === 'allow') {
@@ -452,6 +457,23 @@ export function apply(ctx, config = {}) {
 }
 
 /* ───────────── 小工具 ───────────── */
+
+/**
+ * 一条命令带了多个目标、但只有部分被授权时，给出"只对第一个目标执行"的写法。
+ * 纯字符串收窄：不改语义、不调模型，只是把其余目标从命令行里去掉。
+ */
+function narrowerOptions(effect, targets) {
+  const raw = String(effect?.raw ?? '').trim();
+  if (!raw) return undefined;
+  const present = (targets ?? []).filter((x) => x && raw.includes(x));
+  if (present.length < 2) return undefined;
+  const keep = present[0];
+  let cmd = raw;
+  for (const x of present.slice(1)) cmd = cmd.split(x).join('');
+  cmd = cmd.replace(/\s+/g, ' ').trim();
+  if (!cmd || cmd === raw) return undefined;
+  return [{ label: '只对 ' + keep + ' 执行（其余目标未获授权）', op: effect?.op ?? 'execute', scope: cmd }];
+}
 
 function stableKey(value) {
   const seen = new WeakSet();
