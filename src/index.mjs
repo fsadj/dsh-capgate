@@ -170,9 +170,10 @@ export function apply(ctx, config = {}) {
         return next();
       }
     }
-    // 薄层⑥：同一类被人批准过 2 次 → 本会话内免问（只对同一 class key 生效）
-    if ((approvalsOf(sid).get(klass.key) ?? 0) >= 2) {
-      audit({ event: 'allow', by: 'learned', sid, tool: exec.name, class: klass.key });
+    // 薄层⑥：**同一目标集合**被人批准过 2 次 → 本会话内免问。
+    // 只认"同一批目标"，不从"批了 A"推出"B 也免问"。
+    if ((approvalsOf(sid).get(approvalKey(klass, targets)) ?? 0) >= 2) {
+      audit({ event: 'allow', by: 'learned', sid, tool: exec.name, class: klass.key, targets: targets.slice(0, 5) });
       return next();
     }
     if (cfg.autoAllowReads && klass.op === 'read' && klass.scope === 'workspace') {
@@ -347,8 +348,11 @@ export function apply(ctx, config = {}) {
       const sig = req.callId ? sigByCall.get(String(req.callId)) : undefined;
       if (sig) store.approveSignature(sid, sig);
       if (pending.targets?.length) store.addExtent(sid, pending.op, pending.targets);
-      // 薄层⑥：记一次人工批准（同类累计 2 次后免问）
-      approvalsOf(sid).set(pending.key, (approvalsOf(sid).get(pending.key) ?? 0) + 1);
+      // 薄层⑥：记一次人工批准（**同一目标集合**累计 2 次后免问）
+      {
+        const key = approvalKey({ key: pending.key, op: pending.op }, pending.targets ?? []);
+        approvalsOf(sid).set(key, (approvalsOf(sid).get(key) ?? 0) + 1);
+      }
       // 薄层③：人批准过的写，等于"这个目标存在于本任务"
       if (pending.op === 'write') for (const x of pending.targets ?? []) createdOf(sid).add(String(x));
       audit({ event: 'grant', by: 'human', sid, tool: req.toolName, class: pending.key, targets: pending.targets?.slice(0, 5) });
@@ -501,6 +505,15 @@ export function apply(ctx, config = {}) {
 }
 
 /* ───────────── 小工具 ───────────── */
+
+/**
+ * "同一目标集合"的键：class + 排序后的目标。
+ * 免问只认这一把钥匙，不从"批了 A 文件"推出"B 文件也能动"。
+ */
+function approvalKey(klass, targets) {
+  const t = (targets ?? []).map((x) => String(x).toLowerCase()).sort().join(',');
+  return String(klass?.key ?? '') + '::' + t;
+}
 
 /**
  * 一条命令带了多个目标、但只有部分被授权时，给出"只对第一个目标执行"的写法。
