@@ -48,6 +48,7 @@ export const Config = Schema.object({
   customScope: Schema.string().default(''),
   reviewerTimeoutMs: Schema.number().default(45000),
   askPolicy: Schema.union(['ask', 'allow']).default('ask').description('实验：allow = 不问人，直接放行'),
+  maxProbesPerMinute: Schema.number().default(6).description('每个会话每分钟最多几次只读探针'),
   auditPath: Schema.string().default('').description('判定流水（jsonl）'),
   cachePath: Schema.string().default('').description('判定缓存前缀（可落盘）'),
   allowTools: Schema.array(Schema.string()).default([]),
@@ -68,6 +69,8 @@ export function apply(ctx, config = {}) {
   // 薄层状态：本任务创建过的目标（来源推断）、人工批准计数（反复批准）
   const createdByTask = new Map();   // sid -> Set(path)
   const humanApprovals = new Map();  // sid -> Map(classKey -> n)
+  const probeBudget = new Map();  // sid -> { n, resetAt }
+  const deniedSigs = new Map();   // sid -> Set(signature)
   const createdOf = (sid) => { if (!createdByTask.has(sid)) createdByTask.set(sid, new Set()); return createdByTask.get(sid); };
   const approvalsOf = (sid) => { if (!humanApprovals.has(sid)) humanApprovals.set(sid, new Map()); return humanApprovals.get(sid); };
 
@@ -220,6 +223,12 @@ export function apply(ctx, config = {}) {
     } catch { /* 读不到脚本就不给 */ }
     const state = renderState(store, sid);
 
+    // deny 缓存：同一条命令被拒过，直接拒绝，不再调模型
+    if (deniedSigs.get(sid)?.has(sig)) {
+      audit({ event: 'deny', by: 'deny-cache', sid, tool: exec.name, class: klass.key });
+      return { kind: 'deny', reason: 'capgate: 这条命令本会话内已被拒绝过，不再重复复核。' };
+    }
+
     const review = await reviewWithAgent(ctx, agent, {
       tool: exec.name,
       args: JSON.stringify(exec.arguments ?? {}),
@@ -238,10 +247,18 @@ export function apply(ctx, config = {}) {
       allow: true,
     });
 
+    const grounded = isGrounded(review, instructions, facts, targets);
+    if (review && (review.verdict === 'allow' || review.verdict === 'deny') && !grounded) {
+      audit({ event: 'ungrounded', by: 'reviewer', sid, tool: exec.name, class: klass.key, why: String(review.why ?? '').slice(0, 200) });
+      review.verdict = 'ask';
+    }
+
     if (review?.verdict === 'deny') {
       const n = store.deny(sid, klass.key);
       const fp = effectFingerprint({ op: klass.op, targets });
       store.rememberDenied(sid, fp, sig);
+      if (!deniedSigs.has(sid)) deniedSigs.set(sid, new Set());
+      deniedSigs.get(sid).add(sig);
       if (n >= cfg.maxConsecutiveDenials) {
         audit({ event: 'ask', sid, tool: exec.name, class: klass.key, why: 'escalated-after-denials', count: n });
         return guardAsk(agent, askDecision('capgate: 「' + label + '」已连续被拒 ' + n + ' 次，转人工核对。', label, { locks }), label);
@@ -410,6 +427,16 @@ export function apply(ctx, config = {}) {
           if (!exec?.agent?.session?.parentSession) {
             return { ok: false, why: 'capgate_probe is only available to the reviewer subagent' };
           }
+          const budgetSid = sidOf(exec.agent);
+          const now = Date.now();
+          const b = probeBudget.get(budgetSid) ?? { n: 0, resetAt: now + 60000 };
+          if (now > b.resetAt) { b.n = 0; b.resetAt = now + 60000; }
+          if (b.n >= cfg.maxProbesPerMinute) {
+            audit({ event: 'probe_budget', sid: budgetSid, blocked: true });
+            return { ok: false, why: 'probe budget exhausted for this minute; decide with what you have' };
+          }
+          b.n += 1;
+          probeBudget.set(budgetSid, b);
           const out = runProbe(args, { defaultCwd: cwdOf(exec.agent) });
           audit({ event: 'probe', command: String(args?.command ?? '').slice(0, 120), ok: out.ok });
           return out;
@@ -510,6 +537,28 @@ export function apply(ctx, config = {}) {
  * "同一目标集合"的键：class + 排序后的目标。
  * 免问只认这一把钥匙，不从"批了 A 文件"推出"B 文件也能动"。
  */
+/**
+ * 结论是否"有据"：why 里必须出现引号包裹的用户原话片段，或 facts/targets 里的某个值。
+ * 这是对抗内容注入的最后一道：编不出引文的结论不算数。
+ */
+function isGrounded(review, instructions, facts, targets) {
+  const why = String(review?.why ?? '');
+  if (why.trim().length < 8) return false;
+  const quoted = why.match(/["“‘「]([^"”’」]{3,})["”’」]/);
+  if (quoted) {
+    const q = quoted[1].toLowerCase();
+    if (String(instructions ?? '').toLowerCase().includes(q)) return true;
+    if ((facts ?? []).some((f) => String(f).toLowerCase().includes(q))) return true;
+  }
+  const low = why.toLowerCase();
+  if ((targets ?? []).some((x) => low.includes(String(x).toLowerCase()))) return true;
+  if ((facts ?? []).some((f) => {
+    const s = String(f).toLowerCase();
+    return s.length > 12 && low.includes(s.slice(0, 12));
+  })) return true;
+  return false;
+}
+
 function approvalKey(klass, targets) {
   const t = (targets ?? []).map((x) => String(x).toLowerCase()).sort().join(',');
   return String(klass?.key ?? '') + '::' + t;
