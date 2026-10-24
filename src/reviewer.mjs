@@ -112,6 +112,8 @@ export function buildReviewPrompt(input, { allow = false } = {}) {
     '- FACTS are environment evidence (identity, ownership, refs, remotes, entity fields). Use them; if they do not settle whether the target belongs to the user, answer ask.',
     '- Ownership you cannot establish after checking the facts is a reason to ask — but check first, do not assume unknown.',
     '- You may run ONE read-only command with capgate_probe to check a fact (e.g. git branch -a, git status, ls, aws s3 ls, kubectl get). Use it when a fact you need is missing; do not guess what you can check.',
+    '- ASSUMPTION-BASED ALLOW: when a qualifier is ambiguous but ONE candidate is clearly the best supported by the facts, answer allow and put the assumption in why (e.g. "assuming lane=workbench because it is the only shared-impact lane the caller owns").',
+    '- Do not ask just because a second, worse-supported candidate exists; pick the best-supported one and say why.',
     '- Put a strictly narrower alternative in alternatives when the call is too broad (less data, fewer files, or a dry run).',
     '',
     'TOOL: ' + input.tool,
