@@ -65,6 +65,11 @@ export function apply(ctx, config = {}) {
     allowPaths: cfg.allowPaths, denyPaths: cfg.denyPaths, denyKeywords: cfg.denyKeywords,
   });
   const sigByCall = new Map();
+  // 薄层状态：本任务创建过的目标（来源推断）、人工批准计数（反复批准）
+  const createdByTask = new Map();   // sid -> Set(path)
+  const humanApprovals = new Map();  // sid -> Map(classKey -> n)
+  const createdOf = (sid) => { if (!createdByTask.has(sid)) createdByTask.set(sid, new Set()); return createdByTask.get(sid); };
+  const approvalsOf = (sid) => { if (!humanApprovals.has(sid)) humanApprovals.set(sid, new Map()); return humanApprovals.get(sid); };
 
   const mode = () => (cfg.mode === 'standard' ? 'standard' : 'capgate');
   const sidOf = (agent) => String(agent?.session?.id ?? agent?.session?.header?.id ?? 'unknown');
@@ -157,6 +162,19 @@ export function apply(ctx, config = {}) {
         return next();
       }
     }
+    // 薄层③：只动"本任务自己创建过的目标"——来源在本会话内可证
+    if ((klass.op === 'write' || klass.op === 'delete') && targets.length > 0) {
+      const mine = createdOf(sid);
+      if (targets.every((x) => mine.has(String(x)))) {
+        audit({ event: 'allow', by: 'provenance', sid, tool: exec.name, class: klass.key });
+        return next();
+      }
+    }
+    // 薄层⑥：同一类被人批准过 2 次 → 本会话内免问（只对同一 class key 生效）
+    if ((approvalsOf(sid).get(klass.key) ?? 0) >= 2) {
+      audit({ event: 'allow', by: 'learned', sid, tool: exec.name, class: klass.key });
+      return next();
+    }
     if (cfg.autoAllowReads && klass.op === 'read' && klass.scope === 'workspace') {
       audit({ event: 'allow', by: 'read-fast-path', sid, tool: exec.name, class: klass.key });
       return next();
@@ -178,6 +196,27 @@ export function apply(ctx, config = {}) {
     if (ruled?.kind === 'allow') facts.push('a user-configured allow rule matches this call: ' + ruled.rule);
 
     const instructions = collectInstructions(agent);
+    // 薄层①：原话里是否**逐字**出现了这次的全部目标（只作证据，不自己放行）
+    if (instructions && targets.length) {
+      const lower = instructions.toLowerCase();
+      const literal = targets.filter((x) => lower.includes(String(x).toLowerCase()));
+      if (literal.length === targets.length) facts.push('the user words contain every target literally: ' + targets.join(', '));
+      else if (literal.length) facts.push('the user words contain some targets literally: ' + literal.join(', '));
+    }
+    // 薄层⑤：命令引用了工作区里的脚本时，把脚本头部作为事实给 agent
+    try {
+      const cmdText = String(exec.arguments?.command ?? exec.arguments?.script ?? '');
+      const m = cmdText.match(/([\w./\\-]+\.(?:sh|ps1|py|js|mjs|bat|cmd))/);
+      if (m) {
+        const { readFileSync: rf, existsSync: ex } = await import('node:fs');
+        const { resolve: rs } = await import('node:path');
+        const sp = rs(cwd, m[1]);
+        if (ex(sp)) {
+          const head = rf(sp, 'utf8').split('\n').slice(0, 40).join('\n').slice(0, 1200);
+          facts.push('the command runs the script ' + m[1] + ', whose first lines are:\n' + head);
+        }
+      }
+    } catch { /* 读不到脚本就不给 */ }
     const state = renderState(store, sid);
 
     const review = await reviewWithAgent(ctx, agent, {
@@ -220,6 +259,7 @@ export function apply(ctx, config = {}) {
       const blocking = locks.filter((l) => l === 'sensitive');
       if (blocking.length === 0) {
         store.grant(sid, klass.key, { via: 'reviewer', targets });
+        if (klass.op === 'write') for (const x of targets) createdOf(sid).add(String(x));
         audit({ event: 'allow', by: 'reviewer', sid, tool: exec.name, class: klass.key, why: review.why, locks });
         return next();
       }
@@ -307,6 +347,10 @@ export function apply(ctx, config = {}) {
       const sig = req.callId ? sigByCall.get(String(req.callId)) : undefined;
       if (sig) store.approveSignature(sid, sig);
       if (pending.targets?.length) store.addExtent(sid, pending.op, pending.targets);
+      // 薄层⑥：记一次人工批准（同类累计 2 次后免问）
+      approvalsOf(sid).set(pending.key, (approvalsOf(sid).get(pending.key) ?? 0) + 1);
+      // 薄层③：人批准过的写，等于"这个目标存在于本任务"
+      if (pending.op === 'write') for (const x of pending.targets ?? []) createdOf(sid).add(String(x));
       audit({ event: 'grant', by: 'human', sid, tool: req.toolName, class: pending.key, targets: pending.targets?.slice(0, 5) });
     } else if (outcome === 'rejected') {
       store.deny(sid, pending.key);
