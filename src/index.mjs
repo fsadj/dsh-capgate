@@ -47,6 +47,7 @@ export const Config = Schema.object({
   authStyle: Schema.union(STYLES).default('strict').description('strict=未被原话覆盖即范围外；goal=服务目标即可'),
   customScope: Schema.string().default(''),
   reviewerTimeoutMs: Schema.number().default(45000),
+  askPolicy: Schema.union(['ask', 'allow']).default('ask').description('实验：allow = 不问人，直接放行'),
   auditPath: Schema.string().default('').description('判定流水（jsonl）'),
   cachePath: Schema.string().default('').description('判定缓存前缀（可落盘）'),
   allowTools: Schema.array(Schema.string()).default([]),
